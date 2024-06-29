@@ -49,7 +49,7 @@ func (group *Group) AddContains(id int) (ok bool) {
 // AddUsers gets the list of user ids in the Add set.
 func (group *Group) AddUsers() []int {
 	users := []int{}
-	for uid, _ := range group.Add {
+	for uid := range group.Add {
 		users = append(users, uid)
 	}
 	return users
@@ -64,7 +64,7 @@ func (group *Group) RemoveContains(id int) (ok bool) {
 // RemoveUsers gets the list of user ids in the Remove set.
 func (group *Group) RemoveUsers() []int {
 	users := []int{}
-	for uid, _ := range group.Remove {
+	for uid := range group.Remove {
 		users = append(users, uid)
 	}
 	return users
@@ -105,10 +105,10 @@ func (group *Group) MembersInContext(ctx *Context) map[int]bool {
 	}
 
 	for _, curgroup := range groups {
-		for uid, _ := range curgroup.Add {
+		for uid := range curgroup.Add {
 			members[uid] = true
 		}
-		for uid, _ := range curgroup.Remove {
+		for uid := range curgroup.Remove {
 			delete(members, uid)
 		}
 	}
@@ -180,7 +180,7 @@ func GroupMemberCheck(current *Context, acl *Context, name string, user User) (o
 		// The user is part of this group if the remaining name is part of
 		// his access token list. The name check is case-insensitive.
 		for _, token := range user.Tokens() {
-			if strings.ToLower(name) == strings.ToLower(token) {
+			if strings.EqualFold(name, token) {
 				return true
 			}
 		}
@@ -188,10 +188,7 @@ func GroupMemberCheck(current *Context, acl *Context, name string, user User) (o
 	} else if hash {
 		// The client is part of this group if the remaining name matches the
 		// client's cert hash.
-		if strings.ToLower(name) == strings.ToLower(user.CertHash()) {
-			return true
-		}
-		return false
+		return strings.EqualFold(name, user.CertHash())
 	} else if name == "none" {
 		// None
 		return false
@@ -332,8 +329,6 @@ func GroupMemberCheck(current *Context, acl *Context, name string, user User) (o
 		}
 		return isMember
 	}
-
-	return false
 }
 
 // GroupNames gets the list of group names for the given ACL context.

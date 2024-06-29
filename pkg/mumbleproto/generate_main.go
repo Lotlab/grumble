@@ -1,21 +1,22 @@
-// +build ignore
+//go:build ignore
 
 package main
 
 import (
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"os/exec"
 	"regexp"
 )
 
 var replacements = []string{
-	`(?m)^package MumbleProto;$`, `package mumbleproto;`,
+	`(?m)^package MumbleProto;$`, "package mumbleproto;\noption go_package = \"mumble.info/grumble/pkg/mumbleproto\";",
 
 	// Add crypto_modes to Version message.
 	// It is only present in Grumble, not in upstream Murmur.
-	`(?m)^(message Version {)$`, "$1\n\trepeated string crypto_modes = 5;\n",
+	`(?m)^(message Version {)$`, "$1\n\trepeated string crypto_modes = 10;\n",
 }
 
 func main() {
@@ -25,7 +26,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer resp.Body.Close()
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -41,12 +42,12 @@ func main() {
 	}
 
 	// Write Mumble.proto
-	if err := ioutil.WriteFile("Mumble.proto", data, 0644); err != nil {
+	if err := os.WriteFile("Mumble.proto", data, 0644); err != nil {
 		log.Fatal(err)
 	}
 
 	// Run protobuf compiler
-	if err := exec.Command("protoc", "--go_out=.", "Mumble.proto").Run(); err != nil {
+	if err := exec.Command("protoc", "--go_out=.", "--go_opt=paths=source_relative", "Mumble.proto").Run(); err != nil {
 		log.Fatal(err)
 	}
 }

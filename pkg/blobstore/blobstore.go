@@ -9,7 +9,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
-	"io/ioutil"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -38,7 +38,7 @@ var (
 // blobstore's backing directory is called 'blobstore', the blob with
 // only 'hello world' in it will be stored as follows:
 //
-//     blobstore/2a/2aae6c35c94fcfb415dbe95f408b9ce91ee846ed
+//	blobstore/2a/2aae6c35c94fcfb415dbe95f408b9ce91ee846ed
 //
 // The BlobStore is self-synchronizing, relying on the filesystem
 // operations to ensure atomicity. Thus, accessing a single BlobStore
@@ -64,11 +64,7 @@ func isValidKey(key string) bool {
 
 	// Check whether the string is valid hex-encoding.
 	_, err := hex.DecodeString(key)
-	if err != nil {
-		return false
-	}
-
-	return true
+	return err == nil
 }
 
 // extractKeyComponents returns the directory and the filename that the
@@ -106,7 +102,7 @@ func (bs BlobStore) Get(key string) ([]byte, error) {
 	}
 	defer br.Close()
 
-	buf, err := ioutil.ReadAll(br)
+	buf, err := io.ReadAll(br)
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +143,7 @@ func (bs BlobStore) Put(buf []byte) (key string, err error) {
 	} else if os.IsNotExist(err) {
 		// The blob does not exist on disk yet.
 		// Fallthrough.
-	} else if err != nil {
+	} else {
 		return "", err
 	}
 
@@ -166,7 +162,7 @@ func (bs BlobStore) Put(buf []byte) (key string, err error) {
 	// the same blob at the same time. This shouldn't affect
 	// the consistency of the final blob, but worst case, we've
 	// done some extra work.
-	f, err := ioutil.TempFile(blobdir, fn)
+	f, err := os.CreateTemp(blobdir, fn)
 	if err != nil {
 		return "", err
 	}

@@ -1,5 +1,7 @@
 package freezer;
 
+option go_package = "mumble.info/grumble/pkg/freezer";
+
 option optimize_for = SPEED;
 
 message Server {

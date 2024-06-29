@@ -16,7 +16,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
 	"mumble.info/grumble/pkg/cryptstate"
 	"mumble.info/grumble/pkg/mumbleproto"
@@ -68,7 +68,7 @@ type Client struct {
 	clientReady chan bool
 
 	// Version
-	Version    uint32
+	Version    uint32 // todo: change version to Version2 [MAJOR16 MINOR16 PATCH16 UNUSED16]
 	ClientName string
 	OSName     string
 	OSVersion  string
@@ -395,7 +395,6 @@ func (client *Client) SendUDP(buf []byte) error {
 	} else {
 		return client.sendMessage(buf)
 	}
-	panic("unreachable")
 }
 
 // Send a Message to the client.  The Message in msg to the client's
@@ -506,7 +505,7 @@ func (client *Client) tlsRecvLoop() {
 		// what version of the protocol it should speak.
 		if client.state == StateClientConnected {
 			version := &mumbleproto.Version{
-				Version:     proto.Uint32(0x10205),
+				VersionV1:   proto.Uint32(0x10205),
 				Release:     proto.String("Grumble"),
 				CryptoModes: cryptstate.SupportedModes(),
 			}
@@ -535,8 +534,8 @@ func (client *Client) tlsRecvLoop() {
 				return
 			}
 
-			if version.Version != nil {
-				client.Version = *version.Version
+			if version.VersionV1 != nil {
+				client.Version = *version.VersionV1
 			} else {
 				client.Version = 0x10200
 			}
@@ -616,7 +615,7 @@ func (client *Client) sendChannelTree(channel *Channel) {
 	chanstate.Position = proto.Int32(int32(channel.Position))
 
 	links := []uint32{}
-	for cid, _ := range channel.Links {
+	for cid := range channel.Links {
 		links = append(links, uint32(cid))
 	}
 	chanstate.Links = links

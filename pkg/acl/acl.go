@@ -164,6 +164,4 @@ func HasPermission(ctx *Context, user User, perm Permission) bool {
 	} else {
 		return (granted & perm) != NonePermission
 	}
-
-	return false
 }

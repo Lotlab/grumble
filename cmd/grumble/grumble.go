@@ -23,7 +23,7 @@ func main() {
 	var err error
 
 	flag.Parse()
-	if Args.ShowHelp == true {
+	if Args.ShowHelp {
 		Usage()
 		return
 	}
@@ -174,8 +174,9 @@ func main() {
 	// Look through the list of files in the data directory, and
 	// load all virtual servers from disk.
 	servers = make(map[int64]*Server)
+	nameMatch := regexp.MustCompile("^[0-9]+$")
 	for _, name := range names {
-		if matched, _ := regexp.MatchString("^[0-9]+$", name); matched {
+		if nameMatch.MatchString(name) {
 			log.Printf("Loading server %v", name)
 			s, err := NewServerFromFrozen(name)
 			if err != nil {

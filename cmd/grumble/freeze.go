@@ -7,14 +7,13 @@ package main
 import (
 	"errors"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
 	"mumble.info/grumble/pkg/ban"
 	"mumble.info/grumble/pkg/freezer"
@@ -199,7 +198,7 @@ func (channel *Channel) Freeze() (fc *freezer.Channel, err error) {
 
 	// Add linked channels
 	links := []uint32{}
-	for cid, _ := range channel.Links {
+	for cid := range channel.Links {
 		links = append(links, uint32(cid))
 	}
 	fc.Links = links
@@ -400,7 +399,7 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 	}
 	defer r.Close()
 
-	buf, err := ioutil.ReadAll(r)
+	buf, err := io.ReadAll(r)
 	if err != nil {
 		return nil, err
 	}
@@ -509,18 +508,17 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 		}
 
 		for _, val := range values {
-			switch val.(type) {
+			switch fv := val.(type) {
 			case *freezer.User:
-				fu := val.(*freezer.User)
 				// Check if it's a valid freezer.User message. It must at least
 				// have the Id field filled out for us to be able to do anything
 				// with it. Warn the admin if an illegal entry is encountered.
-				if fu.Id == nil {
+				if fv.Id == nil {
 					log.Printf("Skipped User log entry: No id given.")
 					continue
 				}
 
-				userId := *fu.Id
+				userId := *fv.Id
 
 				// Determine whether the user already exists on the server or not.
 				// If the user already exists, this log entry simply updates the
@@ -531,13 +529,13 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 				if !ok {
 					// If no name is given in the log entry, skip this entry.
 					// Also, warn the admin.
-					if fu.Name == nil {
+					if fv.Name == nil {
 						log.Printf("Skipped User creation log entry: No name given.")
 						continue
 					}
 					// Create the new user and increment the UserId
 					// counter for the server if needed.
-					user, err = NewUser(userId, *fu.Name)
+					user, err = NewUser(userId, *fv.Name)
 					if err != nil {
 						return nil, err
 					}
@@ -548,7 +546,7 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 
 				// Merge the contents of the frozen.User into the
 				// user struct.
-				user.Unfreeze(fu)
+				user.Unfreeze(fv)
 
 				// Update the various user maps in the server to
 				// be able to correctly look up the user.
@@ -559,14 +557,13 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 				}
 
 			case *freezer.UserRemove:
-				fu := val.(*freezer.UserRemove)
 				// Check for an invalid message and warn if appropriate.
-				if fu.Id == nil {
+				if fv.Id == nil {
 					log.Printf("Skipped UserRemove log entry: No id given.")
 					continue
 				}
 
-				userId := *fu.Id
+				userId := *fv.Id
 
 				// Does this user even exist?
 				// Warn if we encounter an illegal delete op.
@@ -584,24 +581,23 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 				}
 
 			case *freezer.Channel:
-				fc := val.(*freezer.Channel)
 				// Check whether the log entry is legal.
-				if fc.Id == nil {
+				if fv.Id == nil {
 					log.Printf("Skipped Channel log entry: No id given.")
 					continue
 				}
 
-				channelId := int(*fc.Id)
+				channelId := int(*fv.Id)
 
 				channel, alreadyExists := s.Channels[channelId]
 				if !alreadyExists {
-					if fc.Name == nil {
+					if fv.Name == nil {
 						log.Printf("Skipped Channel creation log entry: No name given.")
 						continue
 					}
 					// Add the channel and increment the server's
 					// nextChanId field to a consistent state.
-					channel = NewChannel(channelId, *fc.Name)
+					channel = NewChannel(channelId, *fv.Name)
 					if channel.Id >= s.nextChanId {
 						s.nextChanId = channel.Id + 1
 					}
@@ -609,42 +605,39 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 
 				// Unfreeze the contents of the frozen channel
 				// into the existing or newly-created channel.
-				channel.Unfreeze(fc)
+				channel.Unfreeze(fv)
 				// Re-add it to the server's channel map (in case
 				// the channel was newly-created)
 				s.Channels[channelId] = channel
 
 				// Mark the channel's parent
 				if !alreadyExists {
-					if fc.ParentId != nil {
-						parents[*fc.Id] = *fc.ParentId
+					if fv.ParentId != nil {
+						parents[*fv.Id] = *fv.ParentId
 					} else {
-						delete(parents, *fc.Id)
+						delete(parents, *fv.Id)
 					}
 				}
 
 			case *freezer.ChannelRemove:
-				fc := val.(*freezer.ChannelRemove)
-				if fc.Id == nil {
+				if fv.Id == nil {
 					log.Printf("Skipped ChannelRemove log entry: No id given.")
 					continue
 				}
-				s.Channels[int(*fc.Id)] = nil
-				delete(parents, *fc.Id)
+				s.Channels[int(*fv.Id)] = nil
+				delete(parents, *fv.Id)
 
 			case *freezer.BanList:
-				fbl := val.(*freezer.BanList)
-				s.UnfreezeBanList(fbl)
+				s.UnfreezeBanList(fv)
 
 			case *freezer.ConfigKeyValuePair:
-				fcfg := val.(*freezer.ConfigKeyValuePair)
-				if fcfg.Key != nil {
+				if fv.Key != nil {
 					// It's an update operation
-					if fcfg.Value != nil {
-						s.cfg.Set(*fcfg.Key, *fcfg.Value)
+					if fv.Value != nil {
+						s.cfg.Set(*fv.Key, *fv.Value)
 						// It's a delete/reset operation.
 					} else {
-						s.cfg.Reset(*fcfg.Key)
+						s.cfg.Reset(*fv.Key)
 					}
 				}
 			}
@@ -655,11 +648,11 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 	for chanId, parentId := range parents {
 		childChan, exists := s.Channels[int(chanId)]
 		if !exists {
-			return nil, errors.New("Non-existant child channel")
+			return nil, errors.New("non-existant child channel")
 		}
 		parentChan, exists := s.Channels[int(parentId)]
 		if !exists {
-			return nil, errors.New("Non-existant parent channel")
+			return nil, errors.New("non-existant parent channel")
 		}
 		parentChan.AddChild(childChan)
 	}
@@ -669,7 +662,7 @@ func NewServerFromFrozen(name string) (s *Server, err error) {
 		if len(channel.Links) > 0 {
 			links := channel.Links
 			channel.Links = make(map[int]*Channel)
-			for chanId, _ := range links {
+			for chanId := range links {
 				targetChannel := s.Channels[chanId]
 				if targetChannel != nil {
 					s.LinkChannels(channel, targetChannel)
@@ -760,7 +753,7 @@ func (server *Server) UpdateFrozenChannel(channel *Channel, state *mumbleproto.C
 	}
 	if len(state.LinksAdd) > 0 || len(state.LinksRemove) > 0 {
 		links := []uint32{}
-		for cid, _ := range channel.Links {
+		for cid := range channel.Links {
 			links = append(links, uint32(cid))
 		}
 		fc.Links = links

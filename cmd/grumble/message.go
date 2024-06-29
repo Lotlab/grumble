@@ -11,7 +11,7 @@ import (
 	"net"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
 	"mumble.info/grumble/pkg/ban"
 	"mumble.info/grumble/pkg/freezer"
@@ -825,10 +825,10 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		// whether a texture is a "new style" or an "old style" texture.
 		texture := userstate.Texture
 		texlen := uint32(0)
-		if texture != nil && len(texture) > 4 {
+		if len(texture) > 4 {
 			texlen = uint32(texture[0])<<24 | uint32(texture[1])<<16 | uint32(texture[2])<<8 | uint32(texture[3])
 		}
-		if texture != nil && len(texture) > 4 && texlen != 600*60*4 {
+		if len(texture) > 4 && texlen != 600*60*4 {
 			// The sent texture is a new-style texture.  Strip it from the message
 			// we send to pre-1.2.2 clients.
 			userstate.Texture = nil
@@ -901,7 +901,7 @@ func (server *Server) handleBanListMessage(client *Client, msg *Message) {
 		return
 	}
 
-	if banlist.Query != nil && *banlist.Query != false {
+	if banlist.Query != nil && *banlist.Query {
 		banlist.Reset()
 
 		server.banlock.RLock()
@@ -1053,7 +1053,7 @@ func (server *Server) handleAclMessage(client *Client, msg *Message) {
 	users := map[int]bool{}
 
 	// Query the current ACL state for the channel
-	if pacl.Query != nil && *pacl.Query != false {
+	if pacl.Query != nil && *pacl.Query {
 		reply.InheritAcls = proto.Bool(channel.ACL.InheritACL)
 		// Walk the channel tree to get all relevant channels.
 		// (Stop if we reach a channel that doesn't have the InheritACL flag set)
@@ -1129,20 +1129,20 @@ func (server *Server) handleAclMessage(client *Client, msg *Message) {
 			// message that maps user ids to usernames.
 			if hasgroup {
 				toadd := map[int]bool{}
-				for uid, _ := range group.Add {
+				for uid := range group.Add {
 					users[uid] = true
 					toadd[uid] = true
 				}
-				for uid, _ := range group.Remove {
+				for uid := range group.Remove {
 					users[uid] = true
 					delete(toadd, uid)
 				}
-				for uid, _ := range toadd {
+				for uid := range toadd {
 					mpgroup.Add = append(mpgroup.Add, uint32(uid))
 				}
 			}
 			if haspgroup {
-				for uid, _ := range pgroup.MembersInContext(&parent.ACL) {
+				for uid := range pgroup.MembersInContext(&parent.ACL) {
 					users[uid] = true
 					mpgroup.InheritedMembers = append(mpgroup.InheritedMembers, uint32(uid))
 				}
@@ -1158,7 +1158,7 @@ func (server *Server) handleAclMessage(client *Client, msg *Message) {
 
 		// Map the user ids in the user map to usernames of users.
 		queryusers := &mumbleproto.QueryUsers{}
-		for uid, _ := range users {
+		for uid := range users {
 			user, ok := server.Users[uint32(uid)]
 			if !ok {
 				client.Printf("Invalid user id in ACL")
@@ -1321,7 +1321,7 @@ func (server *Server) handleUserStatsMessage(client *Client, msg *Message) {
 	details := extended
 	local := extended || target.Channel == client.Channel
 
-	if stats.StatsOnly != nil && *stats.StatsOnly == true {
+	if stats.StatsOnly != nil && *stats.StatsOnly {
 		details = false
 	}
 
@@ -1365,7 +1365,7 @@ func (server *Server) handleUserStatsMessage(client *Client, msg *Message) {
 
 	if details {
 		version := &mumbleproto.Version{}
-		version.Version = proto.Uint32(target.Version)
+		version.VersionV1 = proto.Uint32(target.Version)
 		if len(target.ClientName) > 0 {
 			version.Release = proto.String(target.ClientName)
 		}

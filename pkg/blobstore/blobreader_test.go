@@ -7,7 +7,6 @@ package blobstore
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"testing"
 )
 
@@ -27,13 +26,13 @@ var blobReaderTests = []blobReaderTest{
 
 func TestBlobReader(t *testing.T) {
 	for _, test := range blobReaderTests {
-		rc := ioutil.NopCloser(bytes.NewBufferString(test.Data))
+		rc := io.NopCloser(bytes.NewBufferString(test.Data))
 		br, err := newBlobReader(rc, test.Key)
 		if err != nil {
 			t.Errorf("unable to construct blob reader: %v", err)
 			continue
 		}
-		_, err = io.Copy(ioutil.Discard, br)
+		_, err = io.Copy(io.Discard, br)
 		if err != nil {
 			t.Errorf("got error: %v", err)
 		}

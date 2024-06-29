@@ -11,7 +11,7 @@ import (
 	"io"
 	"math"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // Checks whether the error err is an EOF

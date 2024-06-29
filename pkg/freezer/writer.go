@@ -24,7 +24,7 @@ import (
 	"math"
 	"os"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 // Log implements an append-only log for flattened

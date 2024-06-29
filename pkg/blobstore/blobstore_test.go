@@ -8,13 +8,12 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/hex"
-	"io/ioutil"
 	"os"
 	"testing"
 )
 
 func TestStoreRetrieve(t *testing.T) {
-	dir, err := ioutil.TempDir("", "blobstore")
+	dir, err := os.MkdirTemp("", "blobstore")
 	if err != nil {
 		t.Error(err)
 		return
@@ -42,7 +41,7 @@ func TestStoreRetrieve(t *testing.T) {
 }
 
 func TestReadNonExistantKey(t *testing.T) {
-	dir, err := ioutil.TempDir("", "blobstore")
+	dir, err := os.MkdirTemp("", "blobstore")
 	if err != nil {
 		t.Error(err)
 		return
@@ -62,7 +61,7 @@ func TestReadNonExistantKey(t *testing.T) {
 }
 
 func TestReadInvalidKeyLength(t *testing.T) {
-	dir, err := ioutil.TempDir("", "blobstore")
+	dir, err := os.MkdirTemp("", "blobstore")
 	if err != nil {
 		t.Error(err)
 	}
@@ -83,7 +82,7 @@ func TestReadInvalidKeyLength(t *testing.T) {
 }
 
 func TestReadBadKeyNonHex(t *testing.T) {
-	dir, err := ioutil.TempDir("", "blobstore")
+	dir, err := os.MkdirTemp("", "blobstore")
 	if err != nil {
 		t.Error(err)
 		return

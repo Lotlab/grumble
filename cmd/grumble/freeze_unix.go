@@ -2,17 +2,17 @@
 // The use of this source code is goverened by a BSD-style
 // license that can be found in the LICENSE-file.
 
+//go:build !windows
 // +build !windows
 
 package main
 
 import (
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 func (server *Server) freezeToFile() (err error) {
@@ -30,7 +30,7 @@ func (server *Server) freezeToFile() (err error) {
 	if err != nil {
 		return err
 	}
-	f, err := ioutil.TempFile(filepath.Join(Args.DataDir, "servers", strconv.FormatInt(server.Id, 10)), ".main.fz_")
+	f, err := os.CreateTemp(filepath.Join(Args.DataDir, "servers", strconv.FormatInt(server.Id, 10)), ".main.fz_")
 	if err != nil {
 		return err
 	}

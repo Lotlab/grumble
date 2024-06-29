@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
 	"mumble.info/grumble/pkg/ban"
 	"mumble.info/grumble/pkg/freezer"
@@ -239,11 +239,7 @@ func (server *Server) checkConfigPassword(key, password string) bool {
 	h.Write([]byte(password))
 
 	sum := hex.EncodeToString(h.Sum(nil))
-	if parts[2] == sum {
-		return true
-	}
-
-	return false
+	return parts[2] == sum
 }
 
 // CheckSuperUserPassword checks whether password matches the set SuperUser password.
@@ -265,7 +261,7 @@ func (server *Server) handleIncomingClient(conn net.Conn) (err error) {
 	client := new(Client)
 	addr := conn.RemoteAddr()
 	if addr == nil {
-		err = errors.New("Unable to extract address for client.")
+		err = errors.New("unable to extract address for client")
 		return
 	}
 
@@ -807,7 +803,6 @@ func (server *Server) updateCodecVersions(connecting *Client) {
 	}
 
 	server.Printf("CELT codec switch %#x %#x (PreferAlpha %v) (Opus %v)", uint32(server.AlphaCodec), uint32(server.BetaCodec), server.PreferAlphaCodec, server.Opus)
-	return
 }
 
 func (server *Server) sendUserList(client *Client) {
@@ -1151,7 +1146,7 @@ func (s *Server) RegisterClient(client *Client) (uid uint32, err error) {
 func (s *Server) RemoveRegistration(uid uint32) (err error) {
 	user, ok := s.Users[uid]
 	if !ok {
-		return errors.New("Unknown user ID")
+		return errors.New("unknown user ID")
 	}
 
 	// Remove from user maps
@@ -1178,15 +1173,9 @@ func (s *Server) removeRegisteredUserFromChannel(uid uint32, channel *Channel) {
 	channel.ACL.ACLs = newACL
 
 	for _, grp := range channel.ACL.Groups {
-		if _, ok := grp.Add[int(uid)]; ok {
-			delete(grp.Add, int(uid))
-		}
-		if _, ok := grp.Remove[int(uid)]; ok {
-			delete(grp.Remove, int(uid))
-		}
-		if _, ok := grp.Temporary[int(uid)]; ok {
-			delete(grp.Temporary, int(uid))
-		}
+		delete(grp.Add, int(uid))
+		delete(grp.Remove, int(uid))
+		delete(grp.Temporary, int(uid))
 	}
 
 	for _, subChan := range channel.children {
@@ -1564,13 +1553,13 @@ func (server *Server) Stop() (err error) {
 		client.Disconnect()
 	}
 
-	// Wait for the HTTP server to shutdown gracefully
-	// A client could theoretically block the server from ever stopping by
-	// never letting the HTTP connection go idle, so we give 15 seconds of grace time.
-	// This does not apply to opened WebSockets, which were forcibly closed when
-	// all clients were disconnected.
-	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(15*time.Second))
 	if server.ListenWebPort() {
+		// Wait for the HTTP server to shutdown gracefully
+		// A client could theoretically block the server from ever stopping by
+		// never letting the HTTP connection go idle, so we give 15 seconds of grace time.
+		// This does not apply to opened WebSockets, which were forcibly closed when
+		// all clients were disconnected.
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(15*time.Second))
 		err = server.webhttp.Shutdown(ctx)
 		cancel()
 		if err == context.DeadlineExceeded {

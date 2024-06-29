@@ -12,7 +12,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/xml"
-	"io/ioutil"
+	"io"
 	"net/http"
 )
 
@@ -70,9 +70,7 @@ func (server *Server) RegisterPublicServer() {
 	// include a digest of the leaf certiifcate in the registration XML document
 	// we send off to the server.
 	config := &tls.Config{}
-	for _, cert := range server.tlscfg.Certificates {
-		config.Certificates = append(config.Certificates, cert)
-	}
+	config.Certificates = append(config.Certificates, server.tlscfg.Certificates...)
 
 	hasher := sha1.New()
 	hasher.Write(config.Certificates[0].Certificate[0])
@@ -105,12 +103,12 @@ func (server *Server) RegisterPublicServer() {
 			TLSClientConfig: config,
 		}
 		client := &http.Client{Transport: tr}
-		r, err := client.Post(registerUrl, "text/xml", ioutil.NopCloser(buf))
+		r, err := client.Post(registerUrl, "text/xml", io.NopCloser(buf))
 		if err != nil {
 			server.Printf("register: unable to post registration request: %v", err)
 			return
 		}
-		bodyBytes, err := ioutil.ReadAll(r.Body)
+		bodyBytes, err := io.ReadAll(r.Body)
 		if err == nil {
 			registerMsg := string(bodyBytes)
 			if r.StatusCode == 200 {

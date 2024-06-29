@@ -210,7 +210,7 @@ func populateChannelACLFromDatabase(server *Server, c *Channel, db *sql.DB) erro
 		} else if len(Group) > 0 {
 			aclEntry.Group = Group
 		} else {
-			return errors.New("Invalid ACL: Neither Group or UserId specified")
+			return errors.New("invalid ACL: Neither Group or UserId specified")
 		}
 
 		aclEntry.Deny = acl.Permission(Deny)
@@ -290,7 +290,7 @@ func populateChannelGroupsFromDatabase(server *Server, c *Channel, db *sql.DB) e
 func populateChannelsFromDatabase(server *Server, db *sql.DB, parentId int) error {
 	parent, exists := server.Channels[parentId]
 	if !exists {
-		return errors.New("Non-existant parent")
+		return errors.New("non-existant parent")
 	}
 
 	stmt, err := db.Prepare("SELECT channel_id, name, inheritacl FROM channels WHERE server_id=? AND parent_id=?")
@@ -345,7 +345,7 @@ func populateChannelsFromDatabase(server *Server, db *sql.DB, parentId int) erro
 	}
 
 	// Add subchannels
-	for id, _ := range parent.children {
+	for id := range parent.children {
 		err = populateChannelsFromDatabase(server, db, id)
 		if err != nil {
 			return err
@@ -378,12 +378,12 @@ func populateChannelLinkInfo(server *Server, db *sql.DB) (err error) {
 
 		channel, exists := server.Channels[ChannelId]
 		if !exists {
-			return errors.New("Attempt to perform link operation on non-existant channel.")
+			return errors.New("attempt to perform link operation on non-existant channel")
 		}
 
 		other, exists := server.Channels[LinkId]
 		if !exists {
-			return errors.New("Attempt to perform link operation on non-existant channel.")
+			return errors.New("attempt to perform link operation on non-existant channel")
 		}
 
 		server.LinkChannels(channel, other)

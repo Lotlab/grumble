@@ -27,11 +27,8 @@ type User struct {
 
 // Create a new User
 func NewUser(id uint32, name string) (user *User, err error) {
-	if id < 0 {
-		return nil, errors.New("Invalid user id")
-	}
 	if len(name) == 0 {
-		return nil, errors.New("Invalid username")
+		return nil, errors.New("invalid username")
 	}
 
 	return &User{

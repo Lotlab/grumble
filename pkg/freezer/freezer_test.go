@@ -13,12 +13,12 @@ import (
 	"os"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 var testValues []proto.Message = []proto.Message{
 	&ConfigKeyValuePair{Key: proto.String("Foo")},
-	&BanList{Bans: []*Ban{&Ban{Mask: proto.Uint32(32)}}},
+	&BanList{Bans: []*Ban{{Mask: proto.Uint32(32)}}},
 	&User{Id: proto.Uint32(0), Name: proto.String("SuperUser")},
 	&UserRemove{Id: proto.Uint32(0)},
 	&Channel{Id: proto.Uint32(0), Name: proto.String("RootChannel")},
@@ -211,6 +211,9 @@ func TestUnknownTypeDecode(t *testing.T) {
 // Test a TxRecord with some trailing bytes
 func TestTrailingBytesTxRecord(t *testing.T) {
 	buf, _, err := genTxValue(0xfa, []byte{0xff, 0xff, 0xff})
+	if err != nil {
+		t.Error(err)
+	}
 	// Add some trailing bytes to the tx record
 	buf = append(buf, byte(0xff))
 	buf = append(buf, byte(0xff))
@@ -276,9 +279,6 @@ func TestTxGroupCapacityEnforcement(t *testing.T) {
 	defer os.Remove("capacity-enforcement.log")
 
 	tx := l.BeginTx()
-	if err != nil {
-		t.Error(err)
-	}
 
 	for i := 0; i <= 255; i++ {
 		entry := testValues[i%len(testValues)]
