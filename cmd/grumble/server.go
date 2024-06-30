@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -163,6 +164,13 @@ func NewServer(id int64, dataDir string) (s *Server, err error) {
 	s.nextChanId = 1
 
 	s.Logger = log.New(logtarget.Default, fmt.Sprintf("[%v] ", s.Id), log.LstdFlags|log.Lmicroseconds)
+
+	// Generate random password for superuser
+	randomBytes := make([]byte, 9)
+	rand.Read(randomBytes)
+	rootPassword := base64.StdEncoding.EncodeToString(randomBytes)
+	s.SetSuperUserPassword(rootPassword)
+	s.Logger.Printf("Password for 'SuperUser' set to '%s'", rootPassword)
 
 	return
 }
