@@ -68,7 +68,7 @@ type Client struct {
 	clientReady chan bool
 
 	// Version
-	Version    uint32 // todo: change version to Version2 [MAJOR16 MINOR16 PATCH16 UNUSED16]
+	Version    ClientVersion
 	ClientName string
 	OSName     string
 	OSVersion  string
@@ -300,7 +300,7 @@ func (c *Client) sendPermissionDenied(who *Client, where *Channel, what acl.Perm
 }
 
 // Send permission denied fallback
-func (client *Client) sendPermissionDeniedFallback(denyType mumbleproto.PermissionDenied_DenyType, version uint32, text string) {
+func (client *Client) sendPermissionDeniedFallback(denyType mumbleproto.PermissionDenied_DenyType, version ClientVersion, text string) {
 	pd := &mumbleproto.PermissionDenied{
 		Type: denyType.Enum(),
 	}
@@ -534,10 +534,12 @@ func (client *Client) tlsRecvLoop() {
 				return
 			}
 
-			if version.VersionV1 != nil {
-				client.Version = *version.VersionV1
+			if version.VersionV2 != nil {
+				client.Version = ClientVersion(*version.VersionV2)
+			} else if version.VersionV1 != nil {
+				client.Version = VersionFromV1(*version.VersionV1)
 			} else {
-				client.Version = 0x10200
+				client.Version = VersionFromComponent(1, 2, 0)
 			}
 
 			if version.Release != nil {
@@ -597,7 +599,7 @@ func (client *Client) sendChannelTree(channel *Channel) {
 	}
 
 	if channel.HasDescription() {
-		if client.Version >= 0x10202 {
+		if client.Version.SupportDescBlobHash() {
 			chanstate.DescriptionHash = channel.DescriptionBlobHashBytes()
 		} else {
 			buf, err := blobStore.Get(channel.DescriptionBlob)

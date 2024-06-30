@@ -295,7 +295,7 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 
 		// Broadcast channel add
 		server.broadcastProtoMessageWithPredicate(chanstate, func(client *Client) bool {
-			return client.Version < 0x10202
+			return !client.Version.SupportDescBlobHash()
 		})
 
 		// Remove description if client knows how to handle blobs.
@@ -304,7 +304,7 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 			chanstate.DescriptionHash = channel.DescriptionBlobHashBytes()
 		}
 		server.broadcastProtoMessageWithPredicate(chanstate, func(client *Client) bool {
-			return client.Version >= 0x10202
+			return client.Version.SupportDescBlobHash()
 		})
 
 		// If it's a temporary channel, move the creator in there.
@@ -459,7 +459,7 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 
 		// Broadcast the update
 		server.broadcastProtoMessageWithPredicate(chanstate, func(client *Client) bool {
-			return client.Version < 0x10202
+			return !client.Version.SupportDescBlobHash()
 		})
 
 		// Remove description blob when sending to 1.2.2 >= users. Only send the blob hash.
@@ -469,7 +469,7 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 		}
 		chanstate.DescriptionHash = channel.DescriptionBlobHashBytes()
 		server.broadcastProtoMessageWithPredicate(chanstate, func(client *Client) bool {
-			return client.Version >= 0x10202
+			return client.Version.SupportDescBlobHash()
 		})
 	}
 
@@ -596,7 +596,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		maxChannelUsers := server.cfg.IntValue("MaxChannelUsers")
 		if maxChannelUsers != 0 && len(dstChan.clients) >= maxChannelUsers {
 			client.sendPermissionDeniedFallback(mumbleproto.PermissionDenied_ChannelFull,
-				0x010201, "Channel is full")
+				VersionFromComponent(1, 2, 1), "Channel is full")
 			return
 		}
 	}
@@ -790,7 +790,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		}
 
 		server.broadcastProtoMessageWithPredicate(txtmsg, func(client *Client) bool {
-			return client.Version < 0x10203
+			return !client.Version.SupportRecording()
 		})
 
 		broadcast = true
@@ -833,7 +833,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 			// we send to pre-1.2.2 clients.
 			userstate.Texture = nil
 			err := server.broadcastProtoMessageWithPredicate(userstate, func(client *Client) bool {
-				return client.Version < 0x10202
+				return !client.Version.SupportCommentTextureHash()
 			})
 			if err != nil {
 				server.Panic("Unable to broadcast UserState")
@@ -843,7 +843,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		} else {
 			// Old style texture.  We can send the message as-is.
 			err := server.broadcastProtoMessageWithPredicate(userstate, func(client *Client) bool {
-				return client.Version < 0x10202
+				return !client.Version.SupportCommentTextureHash()
 			})
 			if err != nil {
 				server.Panic("Unable to broadcast UserState")
@@ -875,7 +875,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		}
 
 		err := server.broadcastProtoMessageWithPredicate(userstate, func(client *Client) bool {
-			return client.Version >= 0x10203
+			return client.Version.SupportCommentTextureHash()
 		})
 		if err != nil {
 			server.Panic("Unable to broadcast UserState")
@@ -1365,7 +1365,8 @@ func (server *Server) handleUserStatsMessage(client *Client, msg *Message) {
 
 	if details {
 		version := &mumbleproto.Version{}
-		version.VersionV1 = proto.Uint32(target.Version)
+		version.VersionV1 = proto.Uint32(target.Version.VersionV1())
+		version.VersionV2 = proto.Uint64(target.Version.VersionV2())
 		if len(target.ClientName) > 0 {
 			version.Release = proto.String(target.ClientName)
 		}

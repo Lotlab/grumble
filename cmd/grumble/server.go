@@ -646,7 +646,7 @@ func (server *Server) finishAuthenticate(client *Client) {
 
 		if client.user.HasTexture() {
 			// Does the client support blobs?
-			if client.Version >= 0x10203 {
+			if client.Version.SupportCommentTextureHash() {
 				userstate.TextureHash = client.user.TextureBlobHashBytes()
 			} else {
 				buf, err := blobStore.Get(client.user.TextureBlob)
@@ -659,7 +659,7 @@ func (server *Server) finishAuthenticate(client *Client) {
 
 		if client.user.HasComment() {
 			// Does the client support blobs?
-			if client.Version >= 0x10203 {
+			if client.Version.SupportCommentTextureHash() {
 				userstate.CommentHash = client.user.CommentBlobHashBytes()
 			} else {
 				buf, err := blobStore.Get(client.user.CommentBlob)
@@ -829,7 +829,7 @@ func (server *Server) sendUserList(client *Client) {
 
 			if connectedClient.user.HasTexture() {
 				// Does the client support blobs?
-				if client.Version >= 0x10203 {
+				if client.Version.SupportCommentTextureHash() {
 					userstate.TextureHash = connectedClient.user.TextureBlobHashBytes()
 				} else {
 					buf, err := blobStore.Get(connectedClient.user.TextureBlob)
@@ -842,7 +842,7 @@ func (server *Server) sendUserList(client *Client) {
 
 			if connectedClient.user.HasComment() {
 				// Does the client support blobs?
-				if client.Version >= 0x10203 {
+				if client.Version.SupportCommentTextureHash() {
 					userstate.CommentHash = connectedClient.user.CommentBlobHashBytes()
 				} else {
 					buf, err := blobStore.Get(connectedClient.user.CommentBlob)
