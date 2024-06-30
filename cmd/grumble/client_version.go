@@ -45,3 +45,7 @@ func (v ClientVersion) SupportCommentTextureHash() bool {
 func (v ClientVersion) SendTextureDataInMessage() bool {
 	return v < VersionFromComponent(1, 2, 2)
 }
+
+func (v ClientVersion) SupportProtobuf() bool {
+	return v >= VersionFromComponent(1, 5, 0)
+}

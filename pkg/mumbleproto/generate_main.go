@@ -20,8 +20,23 @@ var replacements = []string{
 }
 
 func main() {
-	// Fetch Mumble.proto
-	resp, err := http.Get("https://raw.githubusercontent.com/mumble-voip/mumble/master/src/Mumble.proto")
+	downloadProto("https://raw.githubusercontent.com/mumble-voip/mumble/master/src/Mumble.proto",
+		"Mumble.proto", "mumble.info/grumble/pkg/mumbleproto", []string{
+			// Add crypto_modes to Version message.
+			// It is only present in Grumble, not in upstream Murmur.
+			`(?m)^(message Version {)$`, "$1\n\trepeated string crypto_modes = 10;\n",
+		})
+
+	downloadProto("https://raw.githubusercontent.com/mumble-voip/mumble/master/src/MumbleUDP.proto",
+		"MumbleUDP.proto", "mumble.info/grumble/pkg/mumbleproto", []string{
+			// Add "UDP" suffix to message of MumbleUDP to avoid name collision
+			`(?m)^message (.+) {$`, "message ${1}UDP {",
+		})
+}
+
+func downloadProto(url, filename string, pkg string, replacements []string) {
+	// Fetch proto
+	resp, err := http.Get(url)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -30,6 +45,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	replacements = append(replacements, `(?m)^package (.+);$`, "package $1;\noption go_package = \""+pkg+"\";")
 
 	// Perform replacements
 	for i := 0; i < len(replacements); i += 2 {
@@ -42,12 +59,12 @@ func main() {
 	}
 
 	// Write Mumble.proto
-	if err := os.WriteFile("Mumble.proto", data, 0644); err != nil {
+	if err := os.WriteFile(filename, data, 0644); err != nil {
 		log.Fatal(err)
 	}
 
 	// Run protobuf compiler
-	if err := exec.Command("protoc", "--go_out=.", "--go_opt=paths=source_relative", "Mumble.proto").Run(); err != nil {
+	if err := exec.Command("protoc", "--go_out=.", "--go_opt=paths=source_relative", filename).Run(); err != nil {
 		log.Fatal(err)
 	}
 }

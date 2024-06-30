@@ -258,9 +258,7 @@ func (pds *PacketData) GetFloat32() float32 {
 		return 0
 	}
 
-	var val uint32
-
-	val = uint32(pds.Next8())<<24 | uint32(pds.Next8())<<16 | uint32(pds.Next8())<<8 | uint32(pds.Next8())
+	val := uint32(pds.Next8())<<24 | uint32(pds.Next8())<<16 | uint32(pds.Next8())<<8 | uint32(pds.Next8())
 	return math.Float32frombits(val)
 }
 
@@ -280,8 +278,7 @@ func (pds *PacketData) GetFloat64() float64 {
 		return 0
 	}
 
-	var val uint64
-	val = uint64(pds.Next8())<<56 | uint64(pds.Next8())<<48 | uint64(pds.Next8())<<40 | uint64(pds.Next8())<<32 | uint64(pds.Next8())<<24 | uint64(pds.Next8())<<16 | uint64(pds.Next8())<<8 | uint64(pds.Next8())
+	val := uint64(pds.Next8())<<56 | uint64(pds.Next8())<<48 | uint64(pds.Next8())<<40 | uint64(pds.Next8())<<32 | uint64(pds.Next8())<<24 | uint64(pds.Next8())<<16 | uint64(pds.Next8())<<8 | uint64(pds.Next8())
 
 	return math.Float64frombits(val)
 }

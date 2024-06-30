@@ -5,7 +5,7 @@
 
 syntax = "proto2";
 
-package mumbleproto;
+package MumbleProto;
 option go_package = "mumble.info/grumble/pkg/mumbleproto";
 
 option optimize_for = SPEED;

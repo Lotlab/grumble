@@ -20,7 +20,6 @@ import (
 	"mumble.info/grumble/pkg/acl"
 	"mumble.info/grumble/pkg/cryptstate"
 	"mumble.info/grumble/pkg/mumbleproto"
-	"mumble.info/grumble/pkg/packetdata"
 )
 
 // A client connection
@@ -323,62 +322,44 @@ func (client *Client) udpRecvLoop() {
 			return
 		}
 
-		kind := (buf[0] >> 5) & 0x07
+		// todo(jim-k): record bandwidth
 
-		switch kind {
-		case mumbleproto.UDPMessageVoiceSpeex:
-			fallthrough
-		case mumbleproto.UDPMessageVoiceCELTAlpha:
-			fallthrough
-		case mumbleproto.UDPMessageVoiceCELTBeta:
-			if client.server.Opus {
-				return
+		pkt, legacy := mumbleproto.ParseUDPPacket(buf, !client.Version.SupportProtobuf())
+		if pkt == nil {
+			client.Printf("unable to parse UDP packet, ignore")
+			return
+		}
+
+		var data []byte
+		if legacy {
+			data = pkt.LegacyData()
+		} else {
+			var err error
+			data, err = pkt.ProtobufData()
+			if err != nil {
+				client.Printf("unable to generate protobuf data, %v", err)
 			}
-			fallthrough
-		case mumbleproto.UDPMessageVoiceOpus:
-			target := buf[0] & 0x1f
-			var counter uint8
-			outbuf := make([]byte, 1024)
+		}
 
-			incoming := packetdata.New(buf[1 : 1+(len(buf)-1)])
-			outgoing := packetdata.New(outbuf[1 : 1+(len(outbuf)-1)])
-			_ = incoming.GetUint32()
-
-			if kind != mumbleproto.UDPMessageVoiceOpus {
-				for {
-					counter = incoming.Next8()
-					incoming.Skip(int(counter & 0x7f))
-					if !((counter&0x80) != 0 && incoming.IsValid()) {
-						break
-					}
-				}
-			} else {
-				size := int(incoming.GetUint16())
-				incoming.Skip(size & 0x1fff)
+		switch v := pkt.(type) {
+		case *mumbleproto.PingPacket:
+			err := client.SendUDP(data)
+			if err != nil {
+				client.Panicf("Unable to send UDP message: %v", err.Error())
 			}
-
-			outgoing.PutUint32(client.Session())
-			outgoing.PutBytes(buf[1 : 1+(len(buf)-1)])
-			outbuf[0] = buf[0] & 0xe0 // strip target
-
-			if target != 0x1f { // VoiceTarget
+		case *mumbleproto.AudioPacket:
+			v.SetSenderSession(client.session)
+			if v.TargetOrContext != mumbleproto.TargetServerLoopback { // VoiceTarget
 				client.server.voicebroadcast <- &VoiceBroadcast{
 					client: client,
-					buf:    outbuf[0 : 1+outgoing.Size()],
-					target: target,
+					buf:    data,
+					target: v.TargetOrContext,
 				}
 			} else { // Server loopback
-				buf := outbuf[0 : 1+outgoing.Size()]
-				err := client.SendUDP(buf)
+				err := client.SendUDP(data)
 				if err != nil {
 					client.Panicf("Unable to send UDP message: %v", err.Error())
 				}
-			}
-
-		case mumbleproto.UDPMessagePing:
-			err := client.SendUDP(buf)
-			if err != nil {
-				client.Panicf("Unable to send UDP message: %v", err.Error())
 			}
 		}
 	}
