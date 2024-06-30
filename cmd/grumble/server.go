@@ -122,6 +122,8 @@ type Server struct {
 
 	// Logging
 	*log.Logger
+
+	DataDir string
 }
 
 type clientLogForwarder struct {
@@ -138,12 +140,13 @@ func (lf clientLogForwarder) Write(incoming []byte) (int, error) {
 }
 
 // Allocate a new Murmur instance
-func NewServer(id int64) (s *Server, err error) {
+func NewServer(id int64, dataDir string) (s *Server, err error) {
 	s = new(Server)
 
 	s.Id = id
 
 	s.cfg = serverconf.New(nil)
+	s.DataDir = dataDir
 
 	s.Users = make(map[uint32]*User)
 	s.UserCertMap = make(map[string]*User)
@@ -1449,8 +1452,8 @@ func (server *Server) Start() (err error) {
 	*/
 
 	// Wrap a TLS listener around the TCP connection
-	certFn := filepath.Join(Args.DataDir, "cert.pem")
-	keyFn := filepath.Join(Args.DataDir, "key.pem")
+	certFn := filepath.Join(server.DataDir, "cert.pem")
+	keyFn := filepath.Join(server.DataDir, "key.pem")
 	cert, err := tls.LoadX509KeyPair(certFn, keyFn)
 	if err != nil {
 		return err

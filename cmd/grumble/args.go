@@ -63,8 +63,8 @@ func defaultDataDir() string {
 	return filepath.Join(homedir, dirname)
 }
 
-func defaultLogPath() string {
-	return filepath.Join(defaultDataDir(), "grumble.log")
+func defaultLogPath(dataDir string) string {
+	return filepath.Join(dataDir, "grumble.log")
 }
 
 func Usage() {
@@ -85,16 +85,24 @@ func Usage() {
 	}
 }
 
-var Args args
+func ParseCommandLines() args {
+	var arg args
 
-func init() {
 	flag.Usage = Usage
 
-	flag.BoolVar(&Args.ShowHelp, "help", false, "")
-	flag.StringVar(&Args.DataDir, "datadir", defaultDataDir(), "")
-	flag.StringVar(&Args.LogPath, "log", defaultLogPath(), "")
-	flag.BoolVar(&Args.RegenKeys, "regen-keys", false, "")
+	flag.BoolVar(&arg.ShowHelp, "help", false, "")
+	flag.StringVar(&arg.DataDir, "datadir", defaultDataDir(), "")
+	flag.StringVar(&arg.LogPath, "log", "", "")
+	flag.BoolVar(&arg.RegenKeys, "regen-keys", false, "")
 
-	flag.StringVar(&Args.SQLiteDB, "import-murmurdb", "", "")
-	flag.BoolVar(&Args.CleanUp, "cleanup", false, "")
+	flag.StringVar(&arg.SQLiteDB, "import-murmurdb", "", "")
+	flag.BoolVar(&arg.CleanUp, "cleanup", false, "")
+
+	flag.Parse()
+
+	if arg.LogPath == "" {
+		arg.LogPath = defaultLogPath(arg.DataDir)
+	}
+
+	return arg
 }

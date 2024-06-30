@@ -39,7 +39,7 @@ const (
 const SQLiteSupport = true
 
 // Import the structure of an existing Murmur SQLite database.
-func MurmurImport(filename string) (err error) {
+func MurmurImport(filename string, dataDir string) (err error) {
 	db, err := sql.Open("sqlite", filename)
 	if err != nil {
 		panic(err.Error())
@@ -63,12 +63,12 @@ func MurmurImport(filename string) (err error) {
 	log.Printf("Found servers: %v (%v servers)", serverids, len(serverids))
 
 	for _, sid := range serverids {
-		m, err := NewServerFromSQLite(sid, db)
+		m, err := NewServerFromSQLite(sid, db, dataDir)
 		if err != nil {
 			return err
 		}
 
-		err = os.Mkdir(filepath.Join(Args.DataDir, strconv.FormatInt(sid, 10)), 0750)
+		err = os.Mkdir(filepath.Join(dataDir, strconv.FormatInt(sid, 10)), 0750)
 		if err != nil {
 			return err
 		}
@@ -85,8 +85,8 @@ func MurmurImport(filename string) (err error) {
 }
 
 // Create a new Server from a Murmur SQLite database
-func NewServerFromSQLite(id int64, db *sql.DB) (s *Server, err error) {
-	s, err = NewServer(id)
+func NewServerFromSQLite(id int64, db *sql.DB, dataDir string) (s *Server, err error) {
+	s, err = NewServer(id, dataDir)
 	if err != nil {
 		return nil, err
 	}
