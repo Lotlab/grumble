@@ -53,16 +53,12 @@ func (server *Server) freezeToFile() (err error) {
 	dst := filepath.Join(server.DataDir, "servers", strconv.FormatInt(server.Id, 10), "main.fz")
 	backup := filepath.Join(server.DataDir, "servers", strconv.FormatInt(server.Id, 10), "backup.fz")
 
-	err = replacefile.ReplaceFile(dst, src, backup, replacefile.Flag(0))
 	// If the dst file does not exist (as in, on first launch)
 	// fall back to os.Rename. ReplaceFile does not work if the
 	// dst file is not there.
-	if os.IsNotExist(err) {
-		err = os.Rename(src, dst)
-		if err != nil {
-			return err
-		}
+	if _, err := os.Stat(dst); os.IsNotExist(err) {
+		return os.Rename(src, dst)
 	}
 
-	return nil
+	return replacefile.ReplaceFile(dst, src, backup, replacefile.Flag(0))
 }
