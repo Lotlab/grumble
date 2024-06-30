@@ -621,17 +621,35 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		}
 	}
 
+	if userstate.Mute != nil || userstate.Deaf != nil || userstate.Suppress != nil {
+		// If the destination user is inside a temporary channel,
+		// the source user needs to have the MuteDeafen ACL in the first
+		// non-temporary parent channel.
+		if target.Channel.IsTemporary() {
+			ch := target.Channel.parent
+			for ch != nil && ch.IsTemporary() {
+				ch = ch.parent
+			}
+
+			if ch == nil || !acl.HasPermission(&ch.ACL, actor, acl.MuteDeafenPermission) {
+				client.sendPermissionDeniedType(mumbleproto.PermissionDenied_TemporaryChannel)
+				return
+			}
+		}
+	}
+
+	rootChan := server.RootChannel()
+
 	// Comment set/clear
 	if userstate.Comment != nil {
 		comment := *userstate.Comment
 
 		// Clearing another user's comment.
 		if target != actor {
-			// Check if actor has 'move' permissions on the root channel. It is needed
+			// Check if actor has 'resetUserContent' permissions on the root channel. It is needed
 			// to clear another user's comment.
-			rootChan := server.RootChannel()
-			if !acl.HasPermission(&rootChan.ACL, actor, acl.MovePermission) {
-				client.sendPermissionDenied(actor, rootChan, acl.MovePermission)
+			if !acl.HasPermission(&rootChan.ACL, actor, acl.ResetUserContentPermission) {
+				client.sendPermissionDenied(actor, rootChan, acl.ResetUserContentPermission)
 				return
 			}
 
@@ -657,6 +675,19 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		if maximg > 0 && len(userstate.Texture) > maximg {
 			client.sendPermissionDeniedType(mumbleproto.PermissionDenied_TextTooLong)
 			return
+		}
+
+		if target != actor {
+			if !acl.HasPermission(&rootChan.ACL, actor, acl.ResetUserContentPermission) {
+				client.sendPermissionDenied(actor, rootChan, acl.ResetUserContentPermission)
+				return
+			}
+
+			// Only allow empty text.
+			if len(userstate.Texture) > 0 {
+				client.sendPermissionDeniedType(mumbleproto.PermissionDenied_TextTooLong)
+				return
+			}
 		}
 	}
 
@@ -690,9 +721,10 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 	//      - PluginContext
 	//      - PluginIdentity
 	//      - Recording
+	//		- ListeningChannel
 	if actor != target && (userstate.SelfDeaf != nil || userstate.SelfMute != nil ||
 		userstate.Texture != nil || userstate.PluginContext != nil || userstate.PluginIdentity != nil ||
-		userstate.Recording != nil) {
+		userstate.Recording != nil || len(userstate.ListeningChannelAdd) > 0 || len(userstate.ListeningChannelRemove) > 0) {
 		client.Panic("Invalid UserState")
 		return
 	}
@@ -784,6 +816,15 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		txtmsg := &mumbleproto.TextMessage{}
 		txtmsg.TreeId = append(txtmsg.TreeId, uint32(0))
 		if target.Recording {
+			if !server.cfg.BoolValue("AllowRecording") {
+				// User tried to start recording even though this server forbids it
+				// -> Kick user
+				removeMsg := &mumbleproto.UserRemove{}
+				removeMsg.Session = proto.Uint32(target.session)
+				removeMsg.Reason = proto.String("Recording is not allowed on this server")
+				client.sendMessage(removeMsg)
+				client.ForceDisconnect()
+			}
 			txtmsg.Message = proto.String(fmt.Sprintf("User '%s' started recording", target.ShownName()))
 		} else {
 			txtmsg.Message = proto.String(fmt.Sprintf("User '%s' stopped recording", target.ShownName()))
@@ -818,6 +859,8 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		}
 	}
 
+	// todo(jim-k): handle channel listening (1.4.x)
+
 	if broadcast {
 		// This variable denotes the length of a zlib-encoded "old-style" texture.
 		// Mumble and Murmur used qCompress and qUncompress from Qt to compress
@@ -833,7 +876,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 			// we send to pre-1.2.2 clients.
 			userstate.Texture = nil
 			err := server.broadcastProtoMessageWithPredicate(userstate, func(client *Client) bool {
-				return !client.Version.SupportCommentTextureHash()
+				return client.Version.SendTextureDataInMessage()
 			})
 			if err != nil {
 				server.Panic("Unable to broadcast UserState")
@@ -843,7 +886,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		} else {
 			// Old style texture.  We can send the message as-is.
 			err := server.broadcastProtoMessageWithPredicate(userstate, func(client *Client) bool {
-				return !client.Version.SupportCommentTextureHash()
+				return client.Version.SendTextureDataInMessage()
 			})
 			if err != nil {
 				server.Panic("Unable to broadcast UserState")
@@ -874,6 +917,7 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 			server.ClearCaches()
 		}
 
+		// todo(jim-k): do not broadcast plugin context and identity
 		err := server.broadcastProtoMessageWithPredicate(userstate, func(client *Client) bool {
 			return client.Version.SupportCommentTextureHash()
 		})

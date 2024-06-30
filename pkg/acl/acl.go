@@ -18,16 +18,18 @@ const (
 	WhisperPermission     = 0x100
 	TextMessagePermission = 0x200
 	TempChannelPermission = 0x400
+	ListenPermission      = 0x800
 
 	// Root channel only
-	KickPermission         = 0x10000
-	BanPermission          = 0x20000
-	RegisterPermission     = 0x40000
-	SelfRegisterPermission = 0x80000
+	KickPermission             = 0x10000
+	BanPermission              = 0x20000
+	RegisterPermission         = 0x40000
+	SelfRegisterPermission     = 0x80000
+	ResetUserContentPermission = 0x100000
 
 	// Extra flags
 	CachedPermission = 0x8000000
-	AllPermissions   = 0xf07ff
+	AllPermissions   = 0x1f0fff
 )
 
 // Permission represents a permission in Mumble's ACL system.

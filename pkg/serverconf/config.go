@@ -20,6 +20,7 @@ var defaultCfg = map[string]string{
 	"RememberChannel":       "true",
 	"WelcomeText":           "Welcome to this server running <b>Grumble</b>.",
 	"SendVersion":           "true",
+	"AllowRecording":        "true",
 }
 
 type Config struct {
