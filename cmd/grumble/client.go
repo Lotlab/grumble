@@ -505,7 +505,8 @@ func (client *Client) tlsRecvLoop() {
 		// what version of the protocol it should speak.
 		if client.state == StateClientConnected {
 			version := &mumbleproto.Version{
-				VersionV1:   proto.Uint32(0x10205),
+				VersionV1:   proto.Uint32(client.server.Version.VersionV1()),
+				VersionV2:   proto.Uint64(client.server.Version.VersionV2()),
 				Release:     proto.String("Grumble"),
 				CryptoModes: cryptstate.SupportedModes(),
 			}

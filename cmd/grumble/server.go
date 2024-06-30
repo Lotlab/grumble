@@ -123,7 +123,9 @@ type Server struct {
 	// Logging
 	*log.Logger
 
+	// Other configurations
 	DataDir string
+	Version ClientVersion
 }
 
 type clientLogForwarder struct {
@@ -147,6 +149,7 @@ func NewServer(id int64, dataDir string) (s *Server, err error) {
 
 	s.cfg = serverconf.New(nil)
 	s.DataDir = dataDir
+	s.Version = VersionFromComponent(1, 2, 5)
 
 	s.Users = make(map[uint32]*User)
 	s.UserCertMap = make(map[string]*User)
