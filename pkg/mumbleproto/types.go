@@ -30,6 +30,8 @@ const (
 	MessageUserStats
 	MessageRequestBlob
 	MessageServerConfig
+	MessageSuggestConfig
+	MessagePluginDataTransmission
 )
 
 const (

@@ -84,3 +84,7 @@ func (d *DbTx) ACLAdd(acl ACL) error {
 func (d *DbTx) ACLRemove(sid, cid uint64, priority int) error {
 	return d.db.Delete(&ACL{}, "server_id = ? AND channel_id = ? AND priority = ?", sid, cid, priority).Error
 }
+
+func (d *DbTx) ACLRemoveByChannel(sid, cid uint64) error {
+	return d.db.Delete(&ACL{}, "server_id = ? AND channel_id = ?", sid, cid).Error
+}

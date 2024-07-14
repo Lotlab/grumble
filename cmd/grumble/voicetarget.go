@@ -4,7 +4,10 @@
 
 package main
 
-import "mumble.info/grumble/pkg/acl"
+import (
+	"mumble.info/grumble/pkg/acl"
+	"mumble.info/grumble/pkg/mumbleproto"
+)
 
 // A VoiceTarget holds information about a single
 // VoiceTarget entry of a Client.
@@ -12,8 +15,9 @@ type VoiceTarget struct {
 	sessions []uint32
 	channels []voiceTargetChannel
 
-	directCache       map[uint32]*Client
-	fromChannelsCache map[uint32]*Client
+	directCache           map[uint32]*Client
+	fromChannelsCache     map[uint32]*Client
+	listeningTargetsCache map[uint32]*VolumeAdjustment
 }
 
 type voiceTargetChannel struct {
@@ -51,102 +55,121 @@ func (vt *VoiceTarget) IsEmpty() bool {
 func (vt *VoiceTarget) ClearCache() {
 	vt.directCache = nil
 	vt.fromChannelsCache = nil
+	vt.listeningTargetsCache = nil
 }
 
 // Send the contents of the VoiceBroadcast to all targets specified in the
 // VoiceTarget.
 func (vt *VoiceTarget) SendVoiceBroadcast(vb *VoiceBroadcast) {
-	buf := vb.buf
-	client := vb.client
+	vt.tryRebuildCache(vb)
+
+	for _, target := range vt.fromChannelsCache {
+		vb.AddReceiver(target, mumbleproto.ContextShout, nil)
+	}
+
+	for _, target := range vt.directCache {
+		vb.AddReceiver(target, mumbleproto.ContextWhisper, nil)
+	}
+
+	for session, adjustment := range vt.listeningTargetsCache {
+		target, ok := vb.sender.server.clients[session]
+		if !ok {
+			continue
+		}
+		vb.AddReceiver(target, mumbleproto.ContextListen, adjustment)
+	}
+}
+
+func (vt *VoiceTarget) tryRebuildCache(vb *VoiceBroadcast) {
+	if vt.directCache != nil && vt.fromChannelsCache != nil && vt.listeningTargetsCache != nil {
+		return
+	}
+
+	client := vb.sender
 	server := client.server
 
-	direct := vt.directCache
-	fromChannels := vt.fromChannelsCache
+	direct := make(map[uint32]*Client)
+	fromChannels := make(map[uint32]*Client)
+	listeningTargets := make(map[uint32]*VolumeAdjustment)
 
-	if direct == nil || fromChannels == nil {
-		direct = make(map[uint32]*Client)
-		fromChannels = make(map[uint32]*Client)
+	for _, vtc := range vt.channels {
+		channel := server.Channels[int(vtc.id)]
+		if channel == nil {
+			continue
+		}
 
-		for _, vtc := range vt.channels {
-			channel := server.Channels[int(vtc.id)]
-			if channel == nil {
-				continue
+		if !vtc.subChannels && !vtc.links && vtc.onlyGroup == "" {
+			if acl.HasPermission(&channel.ACL, client, acl.WhisperPermission) {
+				for _, target := range channel.clients {
+					fromChannels[target.Session()] = target
+				}
+				for _, target := range server.listenerManager.GetListenersForChannel(vtc.id) {
+					volAdj := server.listenerManager.GetVolumeAdjustmentDefault(target, vtc.id)
+					old, ok := listeningTargets[target]
+					if ok && old.Factor > volAdj.Factor {
+						volAdj = *old
+					}
+					listeningTargets[target] = &volAdj
+				}
+			}
+		} else {
+			server.Printf("%v", vtc)
+			newchans := make(map[int]*Channel)
+			if vtc.links {
+				newchans = channel.AllLinks()
+			} else {
+				newchans[channel.Id] = channel
+			}
+			if vtc.subChannels {
+				subchans := channel.AllSubChannels()
+				for k, v := range subchans {
+					newchans[k] = v
+				}
 			}
 
-			if !vtc.subChannels && !vtc.links && vtc.onlyGroup == "" {
-				if acl.HasPermission(&channel.ACL, client, acl.WhisperPermission) {
-					for _, target := range channel.clients {
-						fromChannels[target.Session()] = target
+			// todo(jim-k): handle whisper redirect
+			for _, newchan := range newchans {
+				if acl.HasPermission(&newchan.ACL, client, acl.WhisperPermission) {
+					for _, target := range newchan.clients {
+						if vtc.onlyGroup == "" || acl.GroupMemberCheck(&newchan.ACL, &newchan.ACL, vtc.onlyGroup, target) {
+							fromChannels[target.Session()] = target
+						}
 					}
-				}
-			} else {
-				server.Printf("%v", vtc)
-				newchans := make(map[int]*Channel)
-				if vtc.links {
-					newchans = channel.AllLinks()
-				} else {
-					newchans[channel.Id] = channel
-				}
-				if vtc.subChannels {
-					subchans := channel.AllSubChannels()
-					for k, v := range subchans {
-						newchans[k] = v
-					}
-				}
-				for _, newchan := range newchans {
-					if acl.HasPermission(&newchan.ACL, client, acl.WhisperPermission) {
-						for _, target := range newchan.clients {
-							if vtc.onlyGroup == "" || acl.GroupMemberCheck(&newchan.ACL, &newchan.ACL, vtc.onlyGroup, target) {
-								fromChannels[target.Session()] = target
+
+					for _, id := range server.listenerManager.GetListenersForChannel(uint32(newchan.Id)) {
+						target, ok := server.clients[id]
+						if !ok {
+							continue
+						}
+						if vtc.onlyGroup == "" || acl.GroupMemberCheck(&newchan.ACL, &newchan.ACL, vtc.onlyGroup, target) {
+							volAdj := server.listenerManager.GetVolumeAdjustmentDefault(id, uint32(newchan.Id))
+							old, ok := listeningTargets[id]
+							if ok && old.Factor > volAdj.Factor {
+								volAdj = *old
 							}
+							listeningTargets[id] = &volAdj
 						}
 					}
 				}
 			}
 		}
-
-		for _, session := range vt.sessions {
-			target := server.clients[session]
-			if target != nil {
-				if _, alreadyInFromChannels := fromChannels[target.Session()]; !alreadyInFromChannels {
-					direct[target.Session()] = target
-				}
-			}
-		}
-
-		// Make sure we don't send to ourselves.
-		delete(direct, client.Session())
-		delete(fromChannels, client.Session())
-
-		if vt.directCache == nil {
-			vt.directCache = direct
-		}
-
-		if vt.fromChannelsCache == nil {
-			vt.fromChannelsCache = fromChannels
-		}
 	}
 
-	kind := buf[0] & 0xe0
-
-	if len(fromChannels) > 0 {
-		for _, target := range fromChannels {
-			buf[0] = kind | 2
-			err := target.SendUDP(buf)
-			if err != nil {
-				target.Panicf("Unable to send UDP packet: %v", err.Error())
+	for _, session := range vt.sessions {
+		target := server.clients[session]
+		if target != nil && acl.HasPermission(&target.Channel.ACL, target, acl.WhisperPermission) {
+			if _, alreadyInFromChannels := fromChannels[target.Session()]; !alreadyInFromChannels {
+				direct[target.Session()] = target
 			}
 		}
 	}
 
-	if len(direct) > 0 {
-		for _, target := range direct {
-			buf[0] = kind | 2
-			target.SendUDP(buf)
-			err := target.SendUDP(buf)
-			if err != nil {
-				target.Panicf("Unable to send UDP packet: %v", err.Error())
-			}
-		}
-	}
+	// Make sure the speaker themselves is not contained in these lists
+	delete(direct, client.session)
+	delete(fromChannels, client.session)
+	delete(listeningTargets, client.session)
+
+	vt.directCache = direct
+	vt.fromChannelsCache = fromChannels
+	vt.listeningTargetsCache = listeningTargets
 }

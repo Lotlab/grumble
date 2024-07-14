@@ -10,14 +10,14 @@ import (
 type UDPPacketType int
 
 const (
-	UDPPacketAudio = iota
+	UDPPacketAudio UDPPacketType = iota
 	UDPPacketPing
 )
 
 type AudioCodec int
 
 const (
-	CodecOpus = iota
+	CodecOpus AudioCodec = iota
 	CodecCELTAlpha
 	CodecCELTBeta
 	CodecSpeex
@@ -26,8 +26,17 @@ const (
 type AudioTarget int
 
 const (
-	TargetRegularSpeech  = 0
-	TargetServerLoopback = 31
+	TargetRegularSpeech  AudioTarget = 0
+	TargetServerLoopback AudioTarget = 31
+)
+
+type AudioContext int
+
+const (
+	ContextNormal = iota
+	ContextShout
+	ContextWhisper
+	ContextListen
 )
 
 // UDPPacket is a generic form of parsed UDP packet
@@ -36,6 +45,8 @@ type UDPPacket interface {
 	LegacyData() []byte
 	// ProtobufData will encode the packet into the protobuf format data
 	ProtobufData() ([]byte, error)
+	// Data will encode the packet into legacy or protobuf format data
+	Data(legacy bool) ([]byte, error)
 	// SetSenderSession sets the sender session, if capable
 	SetSenderSession(session uint32)
 }
@@ -56,13 +67,19 @@ func (p *PingPacket) LegacyData() []byte {
 
 func (p *PingPacket) ProtobufData() ([]byte, error) {
 	buffer := make([]byte, 1)
-	buffer[0] = UDPPacketPing
+	buffer[0] = byte(UDPPacketPing)
 	data, err := proto.Marshal(&p.PingUDP)
 	if err != nil {
 		return nil, err
 	}
 	buffer = append(buffer, data...)
 	return buffer, nil
+}
+func (p *PingPacket) Data(legacy bool) ([]byte, error) {
+	if legacy {
+		return p.LegacyData(), nil
+	}
+	return p.ProtobufData()
 }
 
 type AudioPacket struct {
@@ -80,13 +97,13 @@ func (p *AudioPacket) LegacyData() []byte {
 	buffer := make([]byte, 32+len(p.Payload))
 	switch p.UsedCodec {
 	case CodecCELTAlpha:
-		buffer[0] = (UDPMessageVoiceCELTAlpha << 5)
+		buffer[0] = (UDPMessageVoiceCELTAlpha << 5) | p.TargetOrContext
 	case CodecCELTBeta:
-		buffer[0] = (UDPMessageVoiceCELTBeta << 5)
+		buffer[0] = (UDPMessageVoiceCELTBeta << 5) | p.TargetOrContext
 	case CodecSpeex:
-		buffer[0] = (UDPMessageVoiceSpeex << 5)
+		buffer[0] = (UDPMessageVoiceSpeex << 5) | p.TargetOrContext
 	case CodecOpus:
-		buffer[0] = (UDPMessageVoiceOpus << 5)
+		buffer[0] = (UDPMessageVoiceOpus << 5) | p.TargetOrContext
 	default:
 		panic("unreachable")
 	}
@@ -110,12 +127,25 @@ func (p *AudioPacket) LegacyData() []byte {
 		outgoing.CopyBytes(p.Payload)
 	}
 
+	// Positional data
+	if len(p.PositionalData) == 3 {
+		for _, v := range p.PositionalData {
+			outgoing.PutFloat32(v)
+		}
+	}
+
 	return buffer[:1+outgoing.Size()]
 }
 
 func (p *AudioPacket) ProtobufData() ([]byte, error) {
+	// At the moment only Opus is supported in the newer Protobuf UDP protocol
+	// if the encoding is different, we automatically fall back to the legacy package format.
+	if p.UsedCodec != CodecOpus {
+		return p.LegacyData(), nil
+	}
+
 	buffer := make([]byte, 1)
-	buffer[0] = UDPPacketPing
+	buffer[0] = byte(UDPPacketPing)
 	data, err := proto.Marshal(&p.AudioUDP)
 	if err != nil {
 		return nil, err
@@ -124,8 +154,15 @@ func (p *AudioPacket) ProtobufData() ([]byte, error) {
 	return buffer, nil
 }
 
+func (p *AudioPacket) Data(legacy bool) ([]byte, error) {
+	if legacy {
+		return p.LegacyData(), nil
+	}
+	return p.ProtobufData()
+}
+
 // PacketType returns the type of udp packet
-func PacketType(pkt UDPPacket) uint16 {
+func PacketType(pkt UDPPacket) UDPPacketType {
 	switch pkt.(type) {
 	case *PingPacket:
 		return UDPPacketPing
@@ -144,7 +181,7 @@ func ParseUDPPacket(data []byte, isLegacy bool) (pkt UDPPacket, legacy bool) {
 
 	header := data[0]
 	if isLegacy {
-		if header == UDPPacketPing {
+		if header == byte(UDPPacketPing) {
 			pkt = parsePingPacketProtobuf(data[1:])
 			legacy = false
 			return
@@ -173,9 +210,9 @@ func ParseUDPPacket(data []byte, isLegacy bool) (pkt UDPPacket, legacy bool) {
 		}
 	} else {
 		switch header {
-		case UDPPacketPing:
+		case byte(UDPPacketPing):
 			return parsePingPacketProtobuf(data[1:]), false
-		case UDPPacketAudio:
+		case byte(UDPPacketAudio):
 			return parseAudioPacketProtobuf(data[1:]), false
 		}
 	}
@@ -293,8 +330,5 @@ func parseAudioPacketProtobuf(data []byte) *AudioPacket {
 		return nil
 	}
 	audio.Payload = audio.OpusData
-
-	// todo(jim-k): volume adjustment
-
 	return &audio
 }

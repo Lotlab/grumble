@@ -9,12 +9,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"google.golang.org/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
 	"mumble.info/grumble/pkg/ban"
-	"mumble.info/grumble/pkg/freezer"
+	"mumble.info/grumble/pkg/cryptstate"
 	"mumble.info/grumble/pkg/mumbleproto"
 )
 
@@ -22,15 +23,6 @@ type Message struct {
 	buf    []byte
 	kind   uint16
 	client *Client
-}
-
-type VoiceBroadcast struct {
-	// The client who is performing the broadcast
-	client *Client
-	// The VoiceTarget identifier.
-	target byte
-	// The voice packet itself.
-	buf []byte
 }
 
 func (server *Server) handleCryptSetup(client *Client, msg *Message) {
@@ -105,13 +97,16 @@ func (server *Server) handlePingMessage(client *Client, msg *Message) {
 		client.TcpPackets = *ping.TcpPackets
 	}
 
-	client.sendMessage(&mumbleproto.Ping{
+	err = client.sendMessage(&mumbleproto.Ping{
 		Timestamp: ping.Timestamp,
 		Good:      proto.Uint32(uint32(client.crypt.Good)),
 		Late:      proto.Uint32(uint32(client.crypt.Late)),
 		Lost:      proto.Uint32(uint32(client.crypt.Lost)),
 		Resync:    proto.Uint32(uint32(client.crypt.Resync)),
 	})
+	if err != nil {
+		client.Print(err)
+	}
 }
 
 func (server *Server) handleChannelRemoveMessage(client *Client, msg *Message) {
@@ -137,11 +132,7 @@ func (server *Server) handleChannelRemoveMessage(client *Client, msg *Message) {
 	}
 
 	// Update datastore
-	if !channel.IsTemporary() {
-		server.DeleteFrozenChannel(channel)
-	}
-
-	server.RemoveChannel(channel)
+	server.RemoveChannel(channel, nil)
 }
 
 // Handle channel state change.
@@ -164,13 +155,15 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 			client.Panic("Invalid channel specified in ChannelState message")
 			return
 		}
+	} else if client.GlobalLimit.RateLimit(1) {
+		return
 	}
 
 	// Lookup parent
 	if chanstate.Parent != nil {
 		parent, ok = server.Channels[int(*chanstate.Parent)]
 		if !ok {
-			client.Panic("Invalid parent channel specified in ChannelState message")
+			client.Panicf("Invalid parent channel %d specified in ChannelState message", *chanstate.Parent)
 			return
 		}
 	}
@@ -201,6 +194,11 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 	if chanstate.Name != nil {
 		name = *chanstate.Name
 
+		if !server.ValidateChannelName(name) {
+			client.sendPermissionDeniedType(mumbleproto.PermissionDenied_ChannelName)
+			return
+		}
+
 		// We don't allow renames for the root channel.
 		if channel != nil && channel.Id != 0 {
 			// Pick a parent. If the name change is part of a re-parent (a channel move),
@@ -220,9 +218,21 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 		}
 	}
 
+	if parent != nil {
+		if !server.CanNest(parent, channel) {
+			client.sendPermissionDeniedFallback(mumbleproto.PermissionDenied_NestingLimit, VersionFromComponent(1, 2, 4), "Channel nesting limit reached")
+			return
+		}
+	}
+
 	// If the channel does not exist already, the ChannelState message is a create operation.
 	if channel == nil {
 		if parent == nil || len(name) == 0 {
+			return
+		}
+
+		if server.ChannelReachLimit() {
+			client.sendPermissionDeniedFallback(mumbleproto.PermissionDenied_ChannelCountLimit, VersionFromComponent(1, 3, 0), "Channel count limit reached")
 			return
 		}
 
@@ -259,11 +269,9 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 		}
 
 		// Add the new channel
-		channel = server.AddChannel(name)
+		channel = server.AddChannel(name, parent, *chanstate.Temporary)
 		channel.DescriptionBlob = key
-		channel.temporary = *chanstate.Temporary
 		channel.Position = int(*chanstate.Position)
-		parent.AddChild(channel)
 
 		// Add the creator to the channel's admin group
 		if client.IsRegistered() {
@@ -374,9 +382,14 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 				return
 			}
 
+			perm := acl.Permission(acl.MakeChannelPermission)
+			if channel.IsTemporary() {
+				perm = acl.TempChannelPermission
+			}
+
 			// And the user must also have MakeChannel permission in the new parent
-			if !acl.HasPermission(&parent.ACL, client, acl.MakeChannelPermission) {
-				client.sendPermissionDenied(client, parent, acl.MakeChannelPermission)
+			if !acl.HasPermission(&parent.ACL, client, perm) {
+				client.sendPermissionDenied(client, parent, perm)
 				return
 			}
 
@@ -413,6 +426,13 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 					}
 					linkadd = append(linkadd, iter)
 				}
+			}
+		}
+
+		if chanstate.MaxUsers != nil {
+			if !acl.HasPermission(&channel.ACL, client, acl.WritePermission) {
+				client.sendPermissionDenied(client, channel, acl.WritePermission)
+				return
 			}
 		}
 
@@ -457,6 +477,11 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 			server.UnlinkChannels(channel, iter)
 		}
 
+		// Max User change
+		if chanstate.MaxUsers != nil {
+			channel.MaxUsers = int(*chanstate.MaxUsers)
+		}
+
 		// Broadcast the update
 		server.broadcastProtoMessageWithPredicate(chanstate, func(client *Client) bool {
 			return !client.Version.SupportDescBlobHash()
@@ -474,8 +499,9 @@ func (server *Server) handleChannelStateMessage(client *Client, msg *Message) {
 	}
 
 	// Update channel in datastore
-	if !channel.IsTemporary() {
-		server.UpdateFrozenChannel(channel, chanstate)
+	err = server.UpdateChannel(channel)
+	if err != nil {
+		server.Panic(err)
 	}
 }
 
@@ -526,7 +552,7 @@ func (server *Server) handleUserRemoveMessage(client *Client, msg *Message) {
 
 		server.banlock.Lock()
 		server.Bans = append(server.Bans, ban)
-		server.UpdateFrozenBans(server.Bans)
+		server.saveBanList()
 		server.banlock.Unlock()
 	}
 
@@ -568,8 +594,17 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		}
 	}
 
+	if actor == target && actor.GlobalLimit.RateLimit(1) {
+		return
+	}
+
 	userstate.Session = proto.Uint32(target.Session())
 	userstate.Actor = proto.Uint32(actor.Session())
+
+	if userstate.Name != nil {
+		client.sendPermissionDeniedType(mumbleproto.PermissionDenied_UserName)
+		return
+	}
 
 	// Does it have a channel ID?
 	if userstate.ChannelId != nil {
@@ -593,12 +628,40 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 			return
 		}
 
-		maxChannelUsers := server.cfg.IntValue("MaxChannelUsers")
-		if maxChannelUsers != 0 && len(dstChan.clients) >= maxChannelUsers {
+		if server.IsChannelFull(dstChan, client) {
 			client.sendPermissionDeniedFallback(mumbleproto.PermissionDenied_ChannelFull,
 				VersionFromComponent(1, 2, 1), "Channel is full")
 			return
 		}
+	}
+
+	// Channel listening
+	listenChannelsAdd := make([]*Channel, 0)
+	for _, v := range userstate.ListeningChannelAdd {
+		chanListen, ok := server.Channels[int(v)]
+		if !ok {
+			continue
+		}
+		if !acl.HasPermission(&chanListen.ACL, target, acl.ListenPermission) {
+			client.sendPermissionDenied(target, chanListen, acl.ListenPermission)
+			continue
+		}
+
+		maxListenersPerCh := server.cfg.IntValue("MaxListenersPerChannel")
+		if maxListenersPerCh > 0 && server.listenerManager.GetListenerCountForChannel(v) >= maxListenersPerCh {
+			client.sendPermissionDeniedFallback(mumbleproto.PermissionDenied_ChannelListenerLimit,
+				VersionFromComponent(1, 4, 0), "No more listeners allowed in this channel")
+			return
+		}
+
+		MaxListenerProxiesPerUser := server.cfg.IntValue("MaxListenerProxiesPerUser")
+		if MaxListenerProxiesPerUser > 0 && server.listenerManager.GetListenedChannelCountForUser(client.session) >= MaxListenerProxiesPerUser {
+			client.sendPermissionDeniedFallback(mumbleproto.PermissionDenied_UserListenerLimit,
+				VersionFromComponent(1, 4, 0), "No more listeners allowed in this user")
+			return
+		}
+
+		listenChannelsAdd = append(listenChannelsAdd, chanListen)
 	}
 
 	if userstate.Mute != nil || userstate.Deaf != nil || userstate.Suppress != nil || userstate.PrioritySpeaker != nil {
@@ -739,7 +802,10 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		}
 
 		if target.user.TextureBlob != key {
-			target.user.TextureBlob = key
+			if err := server.UserSetTexture(target.user, key); err != nil {
+				server.Panicf("User texture update error: %v", err)
+				return
+			}
 		} else {
 			userstate.Texture = nil
 		}
@@ -766,10 +832,14 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 
 	if userstate.PluginContext != nil {
 		target.PluginContext = userstate.PluginContext
+		// Make sure to clear this from the packet so we don't broadcast it
+		userstate.PluginContext = nil
 	}
 
 	if userstate.PluginIdentity != nil {
 		target.PluginIdentity = *userstate.PluginIdentity
+		// Make sure to clear this from the packet so we don't broadcast it
+		userstate.PluginIdentity = nil
 	}
 
 	if userstate.Comment != nil && target.user != nil {
@@ -779,7 +849,10 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		}
 
 		if target.user.CommentBlob != key {
-			target.user.CommentBlob = key
+			if err := server.UserSetComment(target.user, key); err != nil {
+				server.Panicf("User comment update error: %v", err)
+				return
+			}
 		} else {
 			userstate.Comment = nil
 		}
@@ -859,7 +932,50 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 		}
 	}
 
-	// todo(jim-k): handle channel listening (1.4.x)
+	// Handle channel listening (1.4.x)
+	// Note that it is important to handle the listening channels after channel-joins
+	volumeAdjustmentChannels := make(map[int]bool, 0)
+	for _, adjustment := range userstate.ListeningVolumeAdjustment {
+		listenChan, ok := server.Channels[int(adjustment.GetListeningChannel())]
+		if !ok {
+			continue
+		}
+
+		server.SetChannelListenerVolume(target, listenChan, adjustment.GetVolumeAdjustment())
+		volumeAdjustmentChannels[listenChan.Id] = true
+	}
+
+	for _, c := range listenChannelsAdd {
+		server.AddChannelListener(target, c)
+
+		volumeAdj := server.listenerManager.GetVolumeAdjustment(*userstate.Session, uint32(c.Id)).Factor
+		if _, ok := volumeAdjustmentChannels[c.Id]; !ok {
+			userstate.ListeningVolumeAdjustment = append(userstate.ListeningVolumeAdjustment, &mumbleproto.UserState_VolumeAdjustment{
+				ListeningChannel: proto.Uint32(uint32(c.Id)),
+				VolumeAdjustment: proto.Float32(volumeAdj),
+			})
+		}
+	}
+
+	for _, v := range userstate.ListeningChannelRemove {
+		removeChan, ok := server.Channels[int(v)]
+		if !ok {
+			continue
+		}
+		server.DisableChannelListener(target, removeChan)
+	}
+
+	listenerVolumeChanged := len(userstate.ListeningVolumeAdjustment) > 0
+	listenerChanged := len(listenChannelsAdd) > 0 || len(userstate.ListeningChannelRemove) > 0
+	broadcastVolumeChange := !broadcast && listenerVolumeChanged
+
+	broadcast = broadcast || listenerChanged || broadcastVolumeChange
+
+	if listenerChanged || listenerVolumeChanged {
+		// As whisper targets also contain information about ChannelListeners and
+		// their associated volume adjustment, we have to clear the target cache
+		client.ClearCaches()
+	}
 
 	if broadcast {
 		// This variable denotes the length of a zlib-encoded "old-style" texture.
@@ -917,17 +1033,27 @@ func (server *Server) handleUserStateMessage(client *Client, msg *Message) {
 			server.ClearCaches()
 		}
 
-		// todo(jim-k): do not broadcast plugin context and identity
-		err := server.broadcastProtoMessageWithPredicate(userstate, func(client *Client) bool {
-			return client.Version.SupportCommentTextureHash()
-		})
-		if err != nil {
-			server.Panic("Unable to broadcast UserState")
+		if client.Version.SupportCommentTextureHash() {
+			err = client.sendMessage(userstate)
+			if err != nil {
+				server.Panic("Unable to send UserState")
+			}
 		}
-	}
 
-	if target.IsRegistered() {
-		server.UpdateFrozenUser(target, userstate)
+		broadcastListenerVolumeAdjustments := server.cfg.BoolValue("BroadcastListenerVolumeAdjustments")
+		if !broadcastListenerVolumeAdjustments {
+			// Don't broadcast the volume adjustments to everyone
+			userstate.ListeningVolumeAdjustment = nil
+		}
+
+		if broadcastListenerVolumeAdjustments || !broadcastVolumeChange {
+			err := server.broadcastProtoMessageWithPredicate(userstate, func(client *Client) bool {
+				return client.Version.SupportCommentTextureHash()
+			})
+			if err != nil {
+				server.Panic("Unable to broadcast UserState")
+			}
+		}
 	}
 }
 
@@ -992,8 +1118,7 @@ func (server *Server) handleBanListMessage(client *Client, msg *Message) {
 			server.Bans = append(server.Bans, ban)
 		}
 
-		server.UpdateFrozenBans(server.Bans)
-
+		server.saveBanList()
 		client.Printf("Banlist updated")
 	}
 }
@@ -1004,6 +1129,10 @@ func (server *Server) handleTextMessage(client *Client, msg *Message) {
 	err := proto.Unmarshal(msg.buf, txtmsg)
 	if err != nil {
 		client.Panic(err)
+		return
+	}
+
+	if client.GlobalLimit.RateLimit(1) {
 		return
 	}
 
@@ -1020,6 +1149,7 @@ func (server *Server) handleTextMessage(client *Client, msg *Message) {
 	txtmsg.Message = proto.String(filtered)
 
 	clients := make(map[uint32]*Client)
+	channels := make([]*Channel, 0)
 
 	// Tree
 	for _, chanid := range txtmsg.TreeId {
@@ -1028,8 +1158,32 @@ func (server *Server) handleTextMessage(client *Client, msg *Message) {
 				client.sendPermissionDenied(client, channel, acl.TextMessagePermission)
 				return
 			}
+
+			channels = append(channels, channel)
 			for _, target := range channel.clients {
 				clients[target.Session()] = target
+			}
+		}
+	}
+
+	// Sub channels
+	for len(channels) > 0 {
+		channel := channels[0]
+		channels = channels[1:]
+		if acl.HasPermission(&channel.ACL, client, acl.TextMessagePermission) {
+			for _, sub := range channel.children {
+				channels = append(channels, sub)
+			}
+			// Users directly in that channel
+			for _, target := range channel.clients {
+				clients[target.Session()] = target
+			}
+			// Users only listening in that channel
+			for _, session := range server.listenerManager.GetListenersForChannel(uint32(channel.Id)) {
+				client, ok := server.clients[session]
+				if ok {
+					clients[session] = client
+				}
 			}
 		}
 	}
@@ -1041,8 +1195,16 @@ func (server *Server) handleTextMessage(client *Client, msg *Message) {
 				client.sendPermissionDenied(client, channel, acl.TextMessagePermission)
 				return
 			}
+			// Users directly in that channel
 			for _, target := range channel.clients {
 				clients[target.Session()] = target
+			}
+			// Users only listening in that channel
+			for _, session := range server.listenerManager.GetListenersForChannel(chanid) {
+				client, ok := server.clients[session]
+				if ok {
+					clients[session] = client
+				}
 			}
 		}
 	}
@@ -1087,6 +1249,10 @@ func (server *Server) handleAclMessage(client *Client, msg *Message) {
 	// Does the user have permission to update or look at ACLs?
 	if !acl.HasPermission(&channel.ACL, client, acl.WritePermission) && !(channel.parent != nil && acl.HasPermission(&channel.parent.ACL, client, acl.WritePermission)) {
 		client.sendPermissionDenied(client, channel, acl.WritePermission)
+		return
+	}
+
+	if client.GlobalLimit.RateLimit(1) {
 		return
 	}
 
@@ -1284,9 +1450,35 @@ func (server *Server) handleAclMessage(client *Client, msg *Message) {
 			server.ClearCaches()
 		}
 
-		// Update freezer
-		server.UpdateFrozenChannelACLs(channel)
+		// Update database
+		err := server.UpdateChannel(channel)
+		if err != nil {
+			server.Panic(err)
+		}
+
+		// Send refreshed enter states of this channel to all clients
+		states := &mumbleproto.ChannelState{}
+		states.ChannelId = proto.Uint32(*pacl.ChannelId)
+		states.IsEnterRestricted = proto.Bool(isChannelEnterRestricted(channel))
+
+		for _, client := range server.clients {
+			states.CanEnter = proto.Bool(acl.HasPermission(&channel.ACL, client, acl.EnterPermission))
+			client.sendMessage(states)
+		}
 	}
+}
+
+// Checks whether the given channel has restrictions affecting the ENTER privilege
+func isChannelEnterRestricted(c *Channel) bool {
+	if c == nil {
+		return false
+	}
+	for _, v := range c.ACL.ACLs {
+		if v.Deny&acl.EnterPermission > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // User query
@@ -1302,18 +1494,27 @@ func (server *Server) handleQueryUsers(client *Client, msg *Message) {
 
 	reply := &mumbleproto.QueryUsers{}
 
+	tx := server.DB.Tx()
+	defer tx.Rollback()
+
 	for _, id := range query.Ids {
-		user, exists := server.Users[id]
-		if exists {
+		u, err := tx.UserGetInfo(uint64(server.Id), uint64(id))
+		if err != nil {
+			client.Panic(err)
+		}
+		if u != nil {
 			reply.Ids = append(reply.Ids, id)
-			reply.Names = append(reply.Names, user.Name)
+			reply.Names = append(reply.Names, u.Name)
 		}
 	}
 
 	for _, name := range query.Names {
-		user, exists := server.UserNameMap[name]
-		if exists {
-			reply.Ids = append(reply.Ids, user.Id)
+		u, err := tx.UserGetID(uint64(server.Id), name)
+		if err != nil {
+			client.Panic(err)
+		}
+		if u != nil {
+			reply.Ids = append(reply.Ids, uint32(u.UserID))
 			reply.Names = append(reply.Names, name)
 		}
 	}
@@ -1426,7 +1627,12 @@ func (server *Server) handleUserStatsMessage(client *Client, msg *Message) {
 		stats.Address = target.tcpaddr.IP
 	}
 
-	// fixme(mkrautz): we don't do bandwidth tracking yet
+	bwr := target.Bandwidth
+	stats.Onlinesecs = proto.Uint32(uint32(bwr.OnlineSeconds()))
+	if local {
+		stats.Bandwidth = proto.Uint32(uint32(bwr.Bandwidth()))
+		stats.Idlesecs = proto.Uint32(uint32(bwr.IdleSeconds()))
+	}
 
 	if err := client.sendMessage(stats); err != nil {
 		client.Panic(err)
@@ -1604,15 +1810,22 @@ func (server *Server) handleUserList(client *Client, msg *Message) {
 		return
 	}
 
+	tx := server.DB.Tx()
+	defer tx.Commit()
+
 	// Query user list
 	if len(userlist.Users) == 0 {
-		for uid, user := range server.Users {
-			if uid == 0 {
-				continue
-			}
+		users, _, err := tx.UserList(uint64(server.Id), 1000, 0)
+		if err != nil {
+			client.Panic(err)
+		}
+
+		for _, user := range users {
 			userlist.Users = append(userlist.Users, &mumbleproto.UserList_User{
-				UserId: proto.Uint32(uid),
-				Name:   proto.String(user.Name),
+				UserId:      proto.Uint32(uint32(user.UserID)),
+				Name:        proto.String(user.Name),
+				LastChannel: proto.Uint32(uint32(user.LastChannel)),
+				LastSeen:    proto.String(user.LastActive.Format(time.RFC3339)),
 			})
 		}
 		if err := client.sendMessage(userlist); err != nil {
@@ -1621,37 +1834,166 @@ func (server *Server) handleUserList(client *Client, msg *Message) {
 		}
 		// Rename, registration removal
 	} else {
-		if len(userlist.Users) > 0 {
-			tx := server.freezelog.BeginTx()
-			for _, listUser := range userlist.Users {
-				uid := *listUser.UserId
-				if uid == 0 {
+		for _, user := range userlist.Users {
+			uid := user.GetUserId()
+			if uid == 0 {
+				continue
+			}
+
+			if user.Name == nil {
+				// unregister user
+				err = tx.UserUnregister(uint64(server.Id), uint64(uid))
+				if err != nil {
+					server.Fatal(err)
+				}
+			} else {
+				// Rename user
+				newName := strings.TrimSpace(user.GetName())
+				if server.ValidateUsername(newName) {
+					err := tx.UserRename(uint64(server.Id), uint64(uid), newName)
+					if err != nil {
+						server.Print(err)
+					}
 					continue
 				}
-				user, ok := server.Users[uid]
-				if ok {
-					if listUser.Name == nil {
-						// De-register
-						server.RemoveRegistration(uid)
-						err := tx.Put(&freezer.UserRemove{Id: listUser.UserId})
-						if err != nil {
-							server.Fatal(err)
-						}
-					} else {
-						// Rename user
-						// todo(mkrautz): Validate name.
-						user.Name = *listUser.Name
-						err := tx.Put(&freezer.User{Id: listUser.UserId, Name: listUser.Name})
-						if err != nil {
-							server.Fatal(err)
-						}
-					}
+				// If name is not valid or change failed
+				pd := &mumbleproto.PermissionDenied{
+					Type: mumbleproto.PermissionDenied_UserName.Enum(),
+					Name: &newName,
 				}
-			}
-			err := tx.Commit()
-			if err != nil {
-				server.Fatal(err)
+				if err := client.sendMessage(pd); err != nil {
+					client.Panic(err)
+					return
+				}
 			}
 		}
 	}
+}
+
+// Plugin data transmission
+func (server *Server) handlePluginDataTransmission(client *Client, msg *Message) {
+	data := &mumbleproto.PluginDataTransmission{}
+	err := proto.Unmarshal(msg.buf, data)
+	if err != nil {
+		client.Panicf("%v", err)
+		return
+	}
+
+	if client.PluginLimit.RateLimit(1) {
+		client.Printf("Dropping plugin message sent from %s (%d)", client.ClientName, client.session)
+		return
+	}
+
+	if data.Data == nil || data.DataID == nil {
+		// Messages without data and/or without a data ID can't be used by the clients.
+		// Thus we don't even have to sent them
+		return
+	}
+
+	const MaxDataLength = 1000
+	const MaxDataIDLength = 100
+
+	if len(data.Data) > MaxDataLength || len(*data.DataID) > MaxDataIDLength {
+		return
+	}
+
+	receivers := make(map[uint32]bool)
+	for _, r := range data.ReceiverSessions {
+		receivers[r] = true
+	}
+
+	data.SenderSession = proto.Uint32(client.session)
+	data.ReceiverSessions = nil
+
+	for session := range receivers {
+		client, ok := server.clients[session]
+		if !ok {
+			continue
+		}
+		client.sendMessage(data)
+	}
+}
+
+// Version message handling in connection stage
+func (server *Server) handleVersionMessage(client *Client, msg *Message) {
+	version := &mumbleproto.Version{}
+	err := proto.Unmarshal(msg.buf, version)
+	if err != nil {
+		client.Panicf("%v", err)
+		return
+	}
+	if client.GlobalLimit.RateLimit(1) {
+		return
+	}
+
+	if version.VersionV2 != nil {
+		client.Version = ClientVersion(*version.VersionV2)
+	} else if version.VersionV1 != nil {
+		client.Version = VersionFromV1(*version.VersionV1)
+	} else {
+		client.Version = VersionFromComponent(1, 2, 0)
+	}
+
+	if version.Release != nil {
+		client.ClientName = *version.Release
+	}
+
+	if version.Os != nil {
+		client.OSName = *version.Os
+	}
+
+	if version.OsVersion != nil {
+		client.OSVersion = *version.OsVersion
+	}
+
+	// Extract the client's supported crypto mode.
+	// If the client does not pick a crypto mode
+	// itself, use an invalid mode (the empty string)
+	// as its requested mode. This is effectively
+	// a flag asking for the default crypto mode.
+	requestedMode := ""
+	if len(version.CryptoModes) > 0 {
+		requestedMode = version.CryptoModes[0]
+	}
+
+	// Check if the requested crypto mode is supported
+	// by us. If not, fall back to the default crypto
+	// mode.
+	supportedModes := cryptstate.SupportedModes()
+	ok := false
+	for _, mode := range supportedModes {
+		if requestedMode == mode {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		requestedMode = "OCB2-AES128"
+	}
+
+	client.CryptoMode = requestedMode
+}
+
+// Context action
+func (server *Server) handleContextAction(client *Client, msg *Message) {
+	ctx := &mumbleproto.ContextAction{}
+	err := proto.Unmarshal(msg.buf, ctx)
+	if err != nil {
+		client.Panicf("%v", err)
+		return
+	}
+
+	if ctx.Session == nil {
+		return
+	}
+	client, ok := server.clients[ctx.GetSession()]
+	if !ok {
+		return
+	}
+
+	chanid := -1
+	if ctx.ChannelId != nil {
+		chanid = int(*ctx.ChannelId)
+	}
+	server.Printf("MessageContextAction from client: %d, channel: %d, action: %s", client.session, chanid, ctx.GetAction())
 }

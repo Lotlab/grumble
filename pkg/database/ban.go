@@ -19,14 +19,13 @@ func (s Ban) TableName() string {
 	return "bans"
 }
 
-func (d *DbTx) BanRead(sid uint64, limit, offset int) ([]Ban, int64, error) {
+func (d *DbTx) BanRead(sid uint64) ([]Ban, error) {
 	var bans []Ban
-	var count int64
-	err := d.db.Limit(limit).Offset(offset).Find(&bans, "server_id = ?", sid).Count(&count).Error
+	err := d.db.Find(&bans, "server_id = ?", sid).Error
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	return bans, count, nil
+	return bans, nil
 }
 
 func (d *DbTx) BanWrite(bans []Ban) error {

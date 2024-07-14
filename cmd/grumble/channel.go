@@ -21,6 +21,8 @@ type Channel struct {
 	parent    *Channel
 	children  map[int]*Channel
 
+	MaxUsers int
+
 	// ACL
 	ACL acl.Context
 
@@ -129,4 +131,28 @@ func (channel *Channel) IsTemporary() bool {
 // IsEmpty checks whether the channel is temporary
 func (channel *Channel) IsEmpty() bool {
 	return len(channel.clients) == 0
+}
+
+// Level return the level of this channel
+func (channel *Channel) Level() int {
+	c := channel
+	level := 0
+
+	for c != nil {
+		c = c.parent
+		level++
+	}
+	return level
+}
+
+// Depth return the depth of the children channels
+func (channel *Channel) Depth() int {
+	depth := 0
+	for _, c := range channel.children {
+		d := c.Depth() + 1
+		if d > depth {
+			depth = d
+		}
+	}
+	return depth
 }

@@ -169,3 +169,7 @@ func (d *DbTx) UserSetLastChannel(sid, uid, cid uint64) error {
 func (d *DbTx) UserSetLastDisconnect(sid, uid uint64) error {
 	return d.db.Model(&User{}).Where("server_id = ? AND user_id = ?", sid, uid).Updates(User{LastDisconnect: time.Now()}).Error
 }
+
+func (d *DbTx) UserRename(sid, uid uint64, name string) error {
+	return d.db.Model(&User{}).Where("server_id = ? AND user_id = ?", sid, uid).Updates(User{Name: name}).Error
+}

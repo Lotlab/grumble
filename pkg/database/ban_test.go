@@ -21,7 +21,6 @@ func TestBanList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// todo: ban list should be adjust, e.g. add some primary key to reference
 	err = tx.BanWrite([]database.Ban{
 		{
 			ServerID: sid,
@@ -33,14 +32,11 @@ func TestBanList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	list, count, err := tx.BanRead(sid, 10, 0)
+	list, err := tx.BanRead(sid)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(list) != 1 {
 		t.Errorf("list length %d is not match", len(list))
-	}
-	if count != 1 {
-		t.Errorf("total length %d is not match", count)
 	}
 }

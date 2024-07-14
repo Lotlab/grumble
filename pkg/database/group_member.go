@@ -11,7 +11,7 @@ type GroupMember struct {
 	UserID  uint64 `gorm:"not null;index:group_members_users"`
 	User    *User  `gorm:"belongsTo;foreignKey:ServerID,UserID;references:ServerID,UserID;constraint:OnDelete:CASCADE;"`
 
-	Addit bool // todo(jim-k): what is the usage of this field?
+	Addit bool // Member should be include or exclude for group
 }
 
 func (s GroupMember) TableName() string {

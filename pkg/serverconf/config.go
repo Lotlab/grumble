@@ -9,7 +9,7 @@ import (
 	"sync"
 )
 
-var defaultCfg = map[string]string{
+var DefaultCfg = map[string]string{
 	"MaxBandwidth":          "72000",
 	"MaxUsers":              "1000",
 	"MaxUsersPerChannel":    "0",
@@ -21,6 +21,19 @@ var defaultCfg = map[string]string{
 	"WelcomeText":           "Welcome to this server running <b>Grumble</b>.",
 	"SendVersion":           "true",
 	"AllowRecording":        "true",
+	"ChannelNestingLimit":   "10",
+	"MessageLimit":          "1",
+	"MessageBurst":          "5",
+	"PluginMessageLimit":    "4",
+	"PluginMessageBurst":    "15",
+}
+
+type ConfigRepo interface {
+	Set(key string, value string)
+	StringValue(key string) string
+	IntValue(key string) int
+	Uint32Value(key string) uint32
+	BoolValue(key string) bool
 }
 
 type Config struct {
@@ -30,7 +43,7 @@ type Config struct {
 
 // Create a new Config using cfgMap as the intial internal config map.
 // If cfgMap is nil, ConfigWithMap will create a new config map.
-func New(cfgMap map[string]string) *Config {
+func New(cfgMap map[string]string) ConfigRepo {
 	if cfgMap == nil {
 		cfgMap = make(map[string]string)
 	}
@@ -73,7 +86,7 @@ func (cfg *Config) StringValue(key string) (value string) {
 		return value
 	}
 
-	value, exists = defaultCfg[key]
+	value, exists = DefaultCfg[key]
 	if exists {
 		return value
 	}

@@ -90,7 +90,6 @@ func (d *DbTx) ChannelRemove(sid, cid uint64) error {
 
 func (d *DbTx) ChannelUpdate(sid, cid uint64, name string, parentID int64, inheritACL bool) error {
 	return d.db.Where(&Channel{ServerID: sid, ChannelID: cid}).Updates(Channel{Name: name, ParentID: nullInt64(parentID), InheritACL: inheritACL}).Error
-	// todo(jim-k): idk why but murmur will rebuilt entire group and acl table
 }
 
 func (d *DbTx) ChannelListByParent(sid, parentCID uint64) ([]Channel, error) {

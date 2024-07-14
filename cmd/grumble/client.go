@@ -55,6 +55,9 @@ type Client struct {
 	TcpPingVar float32
 	TcpPackets uint32
 
+	// Bandwidth Recoreder
+	Bandwidth *BandwidthRecorder
+
 	// If the client is a registered user on the server,
 	// the user field will point to the registration record.
 	user *User
@@ -77,6 +80,7 @@ type Client struct {
 	Username        string
 	session         uint32
 	certHash        string
+	certVerified    bool
 	Email           string
 	tokens          []string
 	Channel         *Channel
@@ -89,6 +93,10 @@ type Client struct {
 	Recording       bool
 	PluginContext   []byte
 	PluginIdentity  string
+
+	// RateLimit
+	GlobalLimit *RateLimit
+	PluginLimit *RateLimit
 }
 
 // Debugf implements debug-level printing for Clients.
@@ -104,6 +112,11 @@ func (client *Client) IsRegistered() bool {
 // HasCertificate Does the client have a certificate?
 func (client *Client) HasCertificate() bool {
 	return len(client.certHash) > 0
+}
+
+// IsCertificateValid Is the client has a verified certificate?
+func (client *Client) IsCertificateVerified() bool {
+	return client.certVerified
 }
 
 // IsSuperUser Is the client the SuperUser?
@@ -322,44 +335,41 @@ func (client *Client) udpRecvLoop() {
 			return
 		}
 
-		// todo(jim-k): record bandwidth
-
-		pkt, legacy := mumbleproto.ParseUDPPacket(buf, !client.Version.SupportProtobuf())
-		if pkt == nil {
-			client.Printf("unable to parse UDP packet, ignore")
+		// Limit user bandwidth
+		if !client.Bandwidth.AddFrame(len(buf), client.server.cfg.IntValue("MaxBandwidth")) {
+			client.Printf("user bandwidth reached! pkt size: %d", len(buf))
 			return
 		}
 
-		var data []byte
-		if legacy {
-			data = pkt.LegacyData()
-		} else {
-			var err error
-			data, err = pkt.ProtobufData()
-			if err != nil {
-				client.Printf("unable to generate protobuf data, %v", err)
-			}
+		pkt, legacy := mumbleproto.ParseUDPPacket(buf, !(client.Version.SupportProtobuf() && client.server.Version.SupportProtobuf()))
+		if pkt == nil {
+			client.Printf("unable to parse UDP packet, ignore. %v", buf)
+			return
 		}
 
 		switch v := pkt.(type) {
 		case *mumbleproto.PingPacket:
-			err := client.SendUDP(data)
+			data, err := v.Data(legacy)
+			if err != nil {
+				client.server.Panicf("Unable to encode UDP message: %v", err.Error())
+			}
+			err = client.SendUDP(data)
 			if err != nil {
 				client.Panicf("Unable to send UDP message: %v", err.Error())
 			}
 		case *mumbleproto.AudioPacket:
 			v.SetSenderSession(client.session)
-			if v.TargetOrContext != mumbleproto.TargetServerLoopback { // VoiceTarget
-				client.server.voicebroadcast <- &VoiceBroadcast{
-					client: client,
-					buf:    data,
-					target: v.TargetOrContext,
+			if v.TargetOrContext == uint8(mumbleproto.TargetServerLoopback) { // Server loopback
+				data, err := v.Data(legacy)
+				if err != nil {
+					client.server.Panicf("Unable to encode UDP message: %v", err.Error())
 				}
-			} else { // Server loopback
-				err := client.SendUDP(data)
+				err = client.SendUDP(data)
 				if err != nil {
 					client.Panicf("Unable to send UDP message: %v", err.Error())
 				}
+			} else {
+				client.server.voicebroadcast <- NewVoiceBroadcast(client, v)
 			}
 		}
 	}
@@ -449,6 +459,7 @@ func (client *Client) tlsRecvLoop() {
 				client.udp = false
 				client.udprecv <- msg.buf
 			} else {
+				client.Bandwidth.ResetIdleSeconds()
 				client.server.incoming <- msg
 			}
 		}
@@ -509,59 +520,7 @@ func (client *Client) tlsRecvLoop() {
 				return
 			}
 
-			version := &mumbleproto.Version{}
-			err = proto.Unmarshal(msg.buf, version)
-			if err != nil {
-				client.Panicf("%v", err)
-				return
-			}
-
-			if version.VersionV2 != nil {
-				client.Version = ClientVersion(*version.VersionV2)
-			} else if version.VersionV1 != nil {
-				client.Version = VersionFromV1(*version.VersionV1)
-			} else {
-				client.Version = VersionFromComponent(1, 2, 0)
-			}
-
-			if version.Release != nil {
-				client.ClientName = *version.Release
-			}
-
-			if version.Os != nil {
-				client.OSName = *version.Os
-			}
-
-			if version.OsVersion != nil {
-				client.OSVersion = *version.OsVersion
-			}
-
-			// Extract the client's supported crypto mode.
-			// If the client does not pick a crypto mode
-			// itself, use an invalid mode (the empty string)
-			// as its requested mode. This is effectively
-			// a flag asking for the default crypto mode.
-			requestedMode := ""
-			if len(version.CryptoModes) > 0 {
-				requestedMode = version.CryptoModes[0]
-			}
-
-			// Check if the requested crypto mode is supported
-			// by us. If not, fall back to the default crypto
-			// mode.
-			supportedModes := cryptstate.SupportedModes()
-			ok := false
-			for _, mode := range supportedModes {
-				if requestedMode == mode {
-					ok = true
-					break
-				}
-			}
-			if !ok {
-				requestedMode = "OCB2-AES128"
-			}
-
-			client.CryptoMode = requestedMode
+			client.server.handleVersionMessage(client, msg)
 			client.state = StateClientSentVersion
 		}
 	}

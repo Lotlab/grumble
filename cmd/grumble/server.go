@@ -10,25 +10,27 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/sha512"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash"
 	"log"
 	"net"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/pbkdf2"
 	"google.golang.org/protobuf/proto"
 	"mumble.info/grumble/pkg/acl"
 	"mumble.info/grumble/pkg/ban"
-	"mumble.info/grumble/pkg/freezer"
+	"mumble.info/grumble/pkg/database"
 	"mumble.info/grumble/pkg/htmlfilter"
 	"mumble.info/grumble/pkg/logtarget"
 	"mumble.info/grumble/pkg/mumbleproto"
@@ -76,7 +78,6 @@ type Server struct {
 
 	incoming       chan *Message
 	voicebroadcast chan *VoiceBroadcast
-	cfgUpdate      chan *KeyValuePair
 	tempRemove     chan *Channel
 
 	// Signals to the server that a client has been successfully
@@ -84,7 +85,7 @@ type Server struct {
 	clientAuthenticated chan *Client
 
 	// Server configuration
-	cfg *serverconf.Config
+	cfg serverconf.ConfigRepo
 
 	// Clients
 	clients map[uint32]*Client
@@ -100,22 +101,18 @@ type Server struct {
 	PreferAlphaCodec bool
 	Opus             bool
 
+	// Database
+	DB *database.GrumbleDb
+
 	// Channels
-	Channels   map[int]*Channel
-	nextChanId int
+	Channels       map[int]*Channel
+	nextTempChanID int
 
 	// Users
-	Users       map[uint32]*User
-	UserCertMap map[string]*User
-	UserNameMap map[string]*User
-	nextUserId  uint32
+	Users map[uint32]*User
 
 	// Sessions
 	pool *sessionpool.SessionPool
-
-	// Freezer
-	numLogOps int
-	freezelog *freezer.Log
 
 	// Bans
 	banlock sync.RWMutex
@@ -123,6 +120,8 @@ type Server struct {
 
 	// Logging
 	*log.Logger
+
+	listenerManager ChannelListenerManager
 
 	// Other configurations
 	DataDir string
@@ -143,34 +142,144 @@ func (lf clientLogForwarder) Write(incoming []byte) (int, error) {
 }
 
 // Allocate a new Murmur instance
-func NewServer(id int64, dataDir string) (s *Server, err error) {
+func NewServer(id int64, dataDir string, db *database.GrumbleDb) (s *Server, err error) {
 	s = new(Server)
 
 	s.Id = id
+	s.DB = db
 
-	s.cfg = serverconf.New(nil)
+	s.cfg = NewConfigWrapper(db, uint64(id))
 	s.DataDir = dataDir
-	s.Version = VersionFromComponent(1, 2, 5)
-
-	s.Users = make(map[uint32]*User)
-	s.UserCertMap = make(map[string]*User)
-	s.UserNameMap = make(map[string]*User)
-	s.Users[0], err = NewUser(0, "SuperUser")
-	s.UserNameMap["SuperUser"] = s.Users[0]
-	s.nextUserId = 1
+	s.Version = VersionFromComponent(1, 5, 0)
+	s.nextTempChanID = 10000000 // use a high channel id for identity
 
 	s.Channels = make(map[int]*Channel)
-	s.Channels[0] = NewChannel(0, "Root")
-	s.nextChanId = 1
-
+	s.Users = make(map[uint32]*User)
 	s.Logger = log.New(logtarget.Default, fmt.Sprintf("[%v] ", s.Id), log.LstdFlags|log.Lmicroseconds)
 
 	// Generate random password for superuser
 	randomBytes := make([]byte, 9)
 	rand.Read(randomBytes)
 	rootPassword := base64.StdEncoding.EncodeToString(randomBytes)
-	s.SetSuperUserPassword(rootPassword)
-	s.Logger.Printf("Password for 'SuperUser' set to '%s'", rootPassword)
+
+	// Create root account, channel, groups
+	db.Transaction(func(tx *database.DbTx) error {
+		isNew, err := tx.ServerInit(uint64(id), s.generatePasswordHash(rootPassword))
+		if err != nil {
+			return err
+		}
+
+		if isNew {
+			s.Logger.Printf("Password for 'SuperUser' set to '%s'", rootPassword)
+		}
+
+		// If new server, create initial ACL table
+		if isNew {
+			err = tx.ACLAdd(database.NewACL(uint64(id), 0, 1).WithGroup("admin").Apply(true, true).Grant(acl.WritePermission))
+			if err != nil {
+				return err
+			}
+			err = tx.ACLAdd(database.NewACL(uint64(id), 0, 2).WithGroup("auth").Apply(true, true).Grant(acl.TempChannelPermission))
+			if err != nil {
+				return err
+			}
+			err = tx.ACLAdd(database.NewACL(uint64(id), 0, 3).WithGroup("all").Apply(true, false).Grant(acl.SelfRegisterPermission))
+			if err != nil {
+				return err
+			}
+		}
+
+		// Load channel data from db
+		channels, err := tx.ChannelList(uint64(id))
+		if err != nil {
+			return err
+		}
+		for _, v := range channels {
+			channel := NewChannel(int(v.ChannelID), v.Name)
+			channel.ACL.InheritACL = v.InheritACL
+
+			// Additional information in channel_info table
+			info, err := tx.ChannelInfoGets(v.ServerID, v.ChannelID, []database.ChannelInfoKey{
+				database.ChannelDescription,
+				database.ChannelMaxUsers,
+				database.ChannelPosition,
+			})
+			if err != nil {
+				return err
+			}
+			if v, ok := info[database.ChannelDescription]; ok {
+				channel.DescriptionBlob = v
+			}
+			if v, ok := info[database.ChannelMaxUsers]; ok {
+				channel.MaxUsers, _ = strconv.Atoi(v)
+			}
+			if v, ok := info[database.ChannelPosition]; ok {
+				channel.Position, _ = strconv.Atoi(v)
+			}
+
+			// Restore ACL data
+			acls, err := tx.ACLGet(v.ServerID, v.ChannelID)
+			if err != nil {
+				return err
+			}
+			for _, a := range acls {
+				ACL := acl.ACL{
+					UserId:    int(a.UserID.Int64),
+					Group:     a.GroupName,
+					ApplyHere: a.ApplyHere,
+					ApplySubs: a.ApplySub,
+					Allow:     acl.Permission(a.GrantPriv),
+					Deny:      acl.Permission(a.RevokePriv),
+				}
+				if !a.UserID.Valid {
+					ACL.UserId = -1
+				}
+				channel.ACL.ACLs = append(channel.ACL.ACLs, ACL)
+			}
+
+			// ACL group data
+			groups, err := tx.GroupGetByChannel(v.ServerID, v.ChannelID)
+			if err != nil {
+				return err
+			}
+			for _, g := range groups {
+				group := acl.Group{
+					Name:        g.Name,
+					Inherit:     g.Inherit,
+					Inheritable: g.Inheritable,
+					Add:         make(map[int]bool),
+					Remove:      make(map[int]bool),
+					Temporary:   make(map[int]bool),
+				}
+
+				members, err := tx.GroupMemberList(v.ServerID, g.GroupID)
+				if err != nil {
+					return err
+				}
+				for _, m := range members {
+					if m.Addit {
+						group.Add[int(m.UserID)] = true
+					} else {
+						group.Remove[int(m.UserID)] = true
+					}
+				}
+
+				channel.ACL.Groups[g.Name] = group
+			}
+			s.Channels[int(v.ChannelID)] = channel
+		}
+		for _, v := range channels {
+			if v.ParentID.Valid {
+				s.Channels[int(v.ParentID.Int64)].AddChild(s.Channels[int(v.ChannelID)])
+			}
+		}
+
+		return nil
+	})
+
+	s.listenerManager = NewChannelListenerManager()
+	// Ban list
+	s.readBanList()
 
 	return
 }
@@ -189,85 +298,93 @@ func (server *Server) RootChannel() *Channel {
 	return root
 }
 
-func (server *Server) setConfigPassword(key, password string) {
-	saltBytes := make([]byte, 24)
+func (server *Server) generatePasswordHash(password string) database.UserPasswordHash {
+	saltBytes := make([]byte, 8)
 	_, err := rand.Read(saltBytes)
 	if err != nil {
 		server.Fatalf("Unable to read from crypto/rand: %v", err)
 	}
 
-	salt := hex.EncodeToString(saltBytes)
-	hasher := sha1.New()
-	hasher.Write(saltBytes)
-	hasher.Write([]byte(password))
-	digest := hex.EncodeToString(hasher.Sum(nil))
-
-	// Could be racy, but shouldn't really matter...
-	val := "sha1$" + salt + "$" + digest
-	server.cfg.Set(key, val)
-
-	if server.cfgUpdate != nil {
-		server.cfgUpdate <- &KeyValuePair{Key: key, Value: val}
+	const PBKDF2Iter = 4096
+	key := pbkdf2.Key([]byte(password), saltBytes, PBKDF2Iter, 48, sha512.New384)
+	return database.UserPasswordHash{
+		Salt:          []byte(hex.EncodeToString(saltBytes)),
+		Hash:          hex.EncodeToString(key),
+		KDFIterations: PBKDF2Iter,
 	}
+}
+
+func (server *Server) verifyPasswordHash(hash database.UserPasswordHash, password string) (bool, error) {
+	saltBytes, err := hex.DecodeString(string(hash.Salt))
+	if err != nil {
+		return false, err
+	}
+
+	key := pbkdf2.Key([]byte(password), saltBytes, hash.KDFIterations, 48, sha512.New384)
+	return strings.EqualFold(hex.EncodeToString(key), strings.ToLower(hash.Hash)), nil
 }
 
 // SetSuperUserPassword sets password as the new SuperUser password
 func (server *Server) SetSuperUserPassword(password string) {
-	server.setConfigPassword("SuperUserPassword", password)
+	tx := server.DB.Tx()
+	err := tx.UserSetAuth(uint64(server.Id), 0, server.generatePasswordHash(password))
+	if err != nil {
+		tx.Rollback()
+		log.Fatalf("Failed to change SuperUser password: %v", err)
+	}
+	tx.Commit()
 }
 
 // SetServerPassword sets password as the new Server password
 func (server *Server) SetServerPassword(password string) {
-	server.setConfigPassword("ServerPassword", password)
-}
-
-func (server *Server) checkConfigPassword(key, password string) bool {
-	parts := strings.Split(server.cfg.StringValue(key), "$")
-	if len(parts) != 3 {
-		return false
+	tx := server.DB.Tx()
+	err := tx.ConfigSet(uint64(server.Id), "password", password)
+	if err != nil {
+		tx.Rollback()
+		log.Fatalf("Failed to change server password: %v", err)
 	}
-
-	if len(parts[2]) == 0 {
-		return false
-	}
-
-	var h hash.Hash
-	switch parts[0] {
-	case "sha1":
-		h = sha1.New()
-	default:
-		// no such hash
-		return false
-	}
-
-	// salt
-	if len(parts[1]) > 0 {
-		saltBytes, err := hex.DecodeString(parts[1])
-		if err != nil {
-			server.Fatalf("Unable to decode salt: %v", err)
-		}
-		h.Write(saltBytes)
-	}
-
-	// password
-	h.Write([]byte(password))
-
-	sum := hex.EncodeToString(h.Sum(nil))
-	return parts[2] == sum
+	tx.Commit()
 }
 
 // CheckSuperUserPassword checks whether password matches the set SuperUser password.
 func (server *Server) CheckSuperUserPassword(password string) bool {
-	return server.checkConfigPassword("SuperUserPassword", password)
+	tx := server.DB.Tx()
+	user, err := tx.UserGetAuth(uint64(server.Id), "SuperUser")
+	if err != nil {
+		tx.Rollback()
+		server.Fatalf("Unable to get superuser auth info: %v", err)
+	}
+	tx.Commit()
+
+	ok, err := server.verifyPasswordHash(user.Password, password)
+	if err != nil {
+		server.Fatalf("Unable to verify password: %v", err)
+	}
+	return ok
 }
 
 // CheckServerPassword checks whether password matches the set Server password.
 func (server *Server) CheckServerPassword(password string) bool {
-	return server.checkConfigPassword("ServerPassword", password)
+	tx := server.DB.Tx()
+	pw, err := tx.ConfigGet(uint64(server.Id), "password")
+	if err != nil {
+		tx.Rollback()
+		log.Fatalf("Failed to get server password: %v", err)
+	}
+	tx.Commit()
+	return pw == password
 }
 
 func (server *Server) hasServerPassword() bool {
-	return server.cfg.StringValue("ServerPassword") != ""
+	tx := server.DB.Tx()
+	pw, err := tx.ConfigGet(uint64(server.Id), "password")
+	if err != nil {
+		tx.Rollback()
+		log.Fatalf("Failed to get server password: %v", err)
+	}
+	tx.Commit()
+
+	return pw != ""
 }
 
 // Called by the server to initiate a new client connection.
@@ -296,6 +413,9 @@ func (server *Server) handleIncomingClient(conn net.Conn) (err error) {
 	client.voiceTargets = make(map[uint32]*VoiceTarget)
 
 	client.user = nil
+	client.Bandwidth = NewBandwidthRecorder()
+	client.GlobalLimit = NewRateLimit(uint(server.cfg.IntValue("MessageLimit")), uint(server.cfg.IntValue("MessageBurst")))
+	client.PluginLimit = NewRateLimit(uint(server.cfg.IntValue("PluginMessageLimit")), uint(server.cfg.IntValue("PluginMessageBurst")))
 
 	// Extract user's cert hash
 	// Only consider client certificates for direct connections, not WebSocket connections.
@@ -310,10 +430,15 @@ func (server *Server) handleIncomingClient(conn net.Conn) (err error) {
 
 		state := tlsconn.ConnectionState()
 		if len(state.PeerCertificates) > 0 {
+			cert := state.PeerCertificates[0]
 			hash := sha1.New()
-			hash.Write(state.PeerCertificates[0].Raw)
+			hash.Write(cert.Raw)
 			sum := hash.Sum(nil)
+			// todo(jim-k): verify certificate
 			client.certHash = hex.EncodeToString(sum)
+			if len(cert.EmailAddresses) > 0 {
+				client.Email = cert.EmailAddresses[0]
+			}
 		}
 
 		// Check whether the client's cert hash is banned
@@ -372,11 +497,32 @@ func (server *Server) RemoveClient(client *Client, kicked bool) {
 }
 
 // AddChannel adds a new channel to the server. Automatically assign it a channel ID.
-func (server *Server) AddChannel(name string) (channel *Channel) {
-	channel = NewChannel(server.nextChanId, name)
-	server.Channels[channel.Id] = channel
-	server.nextChanId += 1
+func (server *Server) AddChannel(name string, parent *Channel, isTemp bool) (channel *Channel) {
+	channelID := server.nextTempChanID
+	if !isTemp {
+		parentId := -1
+		if parent != nil {
+			parentId = parent.Id
+		}
 
+		tx := server.DB.Tx()
+		ch, err := tx.ChannelAdd(uint64(server.Id), name, int64(parentId))
+		if err != nil {
+			tx.Rollback()
+			return nil
+		}
+		tx.Commit()
+		channelID = int(ch.ChannelID)
+	} else {
+		server.nextTempChanID += 1
+	}
+
+	channel = NewChannel(channelID, name)
+	channel.temporary = isTemp
+	if parent != nil {
+		parent.AddChild(channel)
+	}
+	server.Channels[channelID] = channel
 	return
 }
 
@@ -388,18 +534,41 @@ func (server *Server) RemoveChanel(channel *Channel) {
 	}
 
 	delete(server.Channels, channel.Id)
+	if !channel.IsTemporary() {
+		tx := server.DB.Tx()
+		err := tx.ChannelRemove(uint64(server.Id), uint64(channel.Id))
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+		tx.Commit()
+	}
 }
 
 // Link two channels
 func (server *Server) LinkChannels(channel *Channel, other *Channel) {
 	channel.Links[other.Id] = other
 	other.Links[channel.Id] = channel
+
+	if !channel.IsTemporary() && !other.IsTemporary() {
+		tx := server.DB.Tx()
+		tx.ChannelLinkAdd(uint64(server.Id), uint64(channel.Id), uint64(other.Id))
+		tx.ChannelLinkAdd(uint64(server.Id), uint64(other.Id), uint64(channel.Id))
+		tx.Commit()
+	}
 }
 
 // Unlink two channels
 func (server *Server) UnlinkChannels(channel *Channel, other *Channel) {
 	delete(channel.Links, other.Id)
 	delete(other.Links, channel.Id)
+
+	if !channel.IsTemporary() && !other.IsTemporary() {
+		tx := server.DB.Tx()
+		tx.ChannelLinkRemove(uint64(server.Id), uint64(channel.Id), uint64(other.Id))
+		tx.ChannelLinkRemove(uint64(server.Id), uint64(other.Id), uint64(channel.Id))
+		tx.Commit()
+	}
 }
 
 // This is the synchronous handler goroutine.
@@ -414,61 +583,24 @@ func (server *Server) handlerLoop() {
 			return
 		// Control channel messages
 		case msg := <-server.incoming:
-			client := msg.client
-			server.handleIncomingMessage(client, msg)
+			server.handleIncomingMessage(msg)
 		// Voice broadcast
 		case vb := <-server.voicebroadcast:
-			if vb.target == 0 { // Current channel
-				channel := vb.client.Channel
-				for _, client := range channel.clients {
-					if client != vb.client {
-						err := client.SendUDP(vb.buf)
-						if err != nil {
-							client.Panicf("Unable to send UDP: %v", err)
-						}
-					}
-				}
-			} else {
-				target, ok := vb.client.voiceTargets[uint32(vb.target)]
-				if !ok {
-					continue
-				}
-
-				target.SendVoiceBroadcast(vb)
-			}
+			server.handleVoiceBroadcast(vb)
 		// Remove a temporary channel
 		case tempChannel := <-server.tempRemove:
 			if tempChannel.IsEmpty() {
-				server.RemoveChannel(tempChannel)
+				server.RemoveChannel(tempChannel, nil)
 			}
 		// Finish client authentication. Send post-authentication
 		// server info.
 		case client := <-server.clientAuthenticated:
 			server.finishAuthenticate(client)
 
-		// Disk freeze config update
-		case kvp := <-server.cfgUpdate:
-			if !kvp.Reset {
-				server.UpdateConfig(kvp.Key, kvp.Value)
-			} else {
-				server.ResetConfig(kvp.Key)
-			}
-
 		// Server registration update
 		// Tick every hour + a minute offset based on the server id.
 		case <-regtick:
 			server.RegisterPublicServer()
-		}
-
-		// Check if its time to sync the server state and re-open the log
-		if server.numLogOps >= LogOpsBeforeSync {
-			server.Print("Writing full server snapshot to disk")
-			err := server.FreezeToFile()
-			if err != nil {
-				server.Fatal(err)
-			}
-			server.numLogOps = 0
-			server.Print("Wrote full server snapshot to disk")
 		}
 	}
 }
@@ -500,6 +632,7 @@ func (server *Server) handleAuthenticate(client *Client, msg *Message) {
 	server.ClearCaches()
 
 	if client.state >= StateClientAuthenticated {
+		// todo(jim-k): authenticated user handling is more complex in murmur, check it later.
 		return
 	}
 
@@ -511,41 +644,83 @@ func (server *Server) handleAuthenticate(client *Client, msg *Message) {
 
 	client.Username = *auth.Username
 
-	if client.Username == "SuperUser" {
-		if auth.Password == nil {
-			client.RejectAuth(mumbleproto.Reject_WrongUserPW, "")
-			return
-		} else {
-			if server.CheckSuperUserPassword(*auth.Password) {
-				ok := false
-				client.user, ok = server.UserNameMap[client.Username]
-				if !ok {
-					client.RejectAuth(mumbleproto.Reject_InvalidUsername, "")
-					return
-				}
+	tx := server.DB.Tx()
+	defer tx.Commit()
+
+	userID := int64(-1)
+	dbu, err := tx.UserGetAuth(uint64(server.Id), client.Username)
+	if err != nil {
+		client.Panicf("Failed to get user info: %v", err)
+	}
+	if dbu != nil {
+		// First try to match with user password
+		if dbu.Password.Hash != "" {
+			success, err := server.verifyPasswordHash(dbu.Password, *auth.Password)
+			if err != nil {
+				client.Panicf("Failed to verify password: %v", err)
+			}
+			if success {
+				userID = int64(dbu.UserID)
 			} else {
 				client.RejectAuth(mumbleproto.Reject_WrongUserPW, "")
 				return
 			}
+		} else if dbu.UserID == 0 {
+			// For superuser, empty password is not allowed
+			client.RejectAuth(mumbleproto.Reject_WrongUserPW, "")
+			return
 		}
-	} else {
-		// First look up registration by name.
-		user, exists := server.UserNameMap[client.Username]
-		if exists {
-			if client.HasCertificate() && user.CertHash == client.CertHash() {
-				client.user = user
-			} else {
-				client.RejectAuth(mumbleproto.Reject_WrongUserPW, "Wrong certificate hash")
-				return
-			}
-		}
+	}
 
-		// Name matching didn't do.  Try matching by certificate.
-		if client.user == nil && client.HasCertificate() {
-			user, exists := server.UserCertMap[client.CertHash()]
-			if exists {
-				client.user = user
+	// Name match failed, try match with certificate
+	if userID < 0 && client.HasCertificate() {
+		// Try match by cert
+		uid, err := tx.UserInfoGetUID(uint64(server.Id), database.UserHash, client.CertHash())
+		if err != nil {
+			client.Panicf("Failed to get user info from cert hash: %v", err)
+		}
+		// If the certificate is verified, try to match with user email
+		if !uid.Valid && client.IsCertificateVerified() {
+			uid, err = tx.UserInfoGetUID(uint64(server.Id), database.UserEmail, client.Email)
+			if err != nil {
+				client.Panicf("Failed to get user info from cert hash: %v", err)
 			}
+		}
+		if uid.Valid {
+			userID = uid.Int64
+			dbu, err = tx.UserGetInfo(uint64(server.Id), uint64(userID))
+			if err != nil {
+				client.Panicf("Failed to get user info from cert hash: %v", err)
+			}
+			client.Username = dbu.Name
+		}
+	}
+
+	if userID >= 0 {
+		user, ok := server.Users[uint32(userID)]
+		if !ok {
+			user = UserFromDatabase(dbu, &tx)
+			server.Users[uint32(userID)] = user
+		}
+		client.user = user
+	} else if dbu != nil {
+		// Non of user password or certificate check is pass
+		client.RejectAuth(mumbleproto.Reject_WrongUserPW, "")
+		return
+	}
+
+	// Update certificate from hash
+	if userID > 0 && client.HasCertificate() {
+		info := make(map[database.UserInfoKey]string)
+		if len(client.certHash) > 0 {
+			info[database.UserHash] = client.certHash
+		}
+		if len(client.Email) > 0 {
+			info[database.UserEmail] = client.Email
+		}
+		err = tx.UserInfoSet(uint64(server.Id), uint64(userID), info)
+		if err != nil {
+			server.Printf("Failed to update user cert and email: %v", err)
 		}
 	}
 
@@ -580,6 +755,7 @@ func (server *Server) handleAuthenticate(client *Client, msg *Message) {
 	client.opus = auth.GetOpus()
 
 	client.state = StateClientAuthenticated
+	client.Bandwidth.ResetIdleSeconds()
 	server.clientAuthenticated <- client
 }
 
@@ -594,20 +770,29 @@ func (server *Server) finishAuthenticate(client *Client) {
 	// previous client and let the new guy in.
 	if client.user != nil {
 		found := false
+		var oldClient *Client = nil
 		for _, connectedClient := range server.clients {
 			if connectedClient.UserId() == client.UserId() {
 				found = true
+				oldClient = connectedClient
 				break
 			}
 		}
 		// The user is already present on the server.
 		if found {
-			// todo(mkrautz): Do the address checking.
-			client.RejectAuth(mumbleproto.Reject_UsernameInUse, "A client is already connected using those credentials.")
-			return
+			if client.tcpaddr.String() != oldClient.tcpaddr.String() {
+				client.RejectAuth(mumbleproto.Reject_UsernameInUse, "A client is already connected using those credentials.")
+				return
+			}
 		}
 
 		// No, that user isn't already connected. Move along.
+	}
+
+	maxUsers := server.cfg.IntValue("MaxUsers")
+	if len(server.Users) >= maxUsers {
+		client.RejectAuth(mumbleproto.Reject_ServerFull, fmt.Sprintf("Server is full (max %d users)", maxUsers))
+		return
 	}
 
 	// Add the client to the connected list
@@ -639,10 +824,20 @@ func (server *Server) finishAuthenticate(client *Client) {
 
 	channel := server.RootChannel()
 	if client.IsRegistered() {
-		lastChannel := server.Channels[client.user.LastChannelId]
-		if lastChannel != nil {
+		lastChannel, ok := server.Channels[client.user.LastChannelId]
+		if ok && acl.HasPermission(&lastChannel.ACL, client, acl.EnterPermission) && !server.IsChannelFull(lastChannel, client) {
 			channel = lastChannel
+		} else {
+			defaultCh, ok := server.Channels[server.cfg.IntValue("DefaultChannel")]
+			if ok && acl.HasPermission(&defaultCh.ACL, client, acl.EnterPermission) && !server.IsChannelFull(defaultCh, client) {
+				channel = defaultCh
+			}
 		}
+	}
+
+	if server.IsChannelFull(channel, client) {
+		client.RejectAuth(mumbleproto.Reject_ServerFull, "Server channels are full")
+		return
 	}
 
 	userstate := &mumbleproto.UserState{
@@ -944,7 +1139,7 @@ func (server *Server) broadcastProtoMessage(msg interface{}) (err error) {
 	return
 }
 
-func (server *Server) handleIncomingMessage(client *Client, msg *Message) {
+func (server *Server) handleIncomingMessage(msg *Message) {
 	switch msg.kind {
 	case mumbleproto.MessageAuthenticate:
 		server.handleAuthenticate(msg.client, msg)
@@ -969,7 +1164,7 @@ func (server *Server) handleIncomingMessage(client *Client, msg *Message) {
 	case mumbleproto.MessageCryptSetup:
 		server.handleCryptSetup(msg.client, msg)
 	case mumbleproto.MessageContextAction:
-		server.Printf("MessageContextAction from client")
+		server.handleContextAction(msg.client, msg)
 	case mumbleproto.MessageUserList:
 		server.handleUserList(msg.client, msg)
 	case mumbleproto.MessageVoiceTarget:
@@ -980,7 +1175,58 @@ func (server *Server) handleIncomingMessage(client *Client, msg *Message) {
 		server.handleUserStatsMessage(msg.client, msg)
 	case mumbleproto.MessageRequestBlob:
 		server.handleRequestBlob(msg.client, msg)
+	case mumbleproto.MessageVersion:
+		server.handleVersionMessage(msg.client, msg)
+	case mumbleproto.MessagePluginDataTransmission:
+		server.handlePluginDataTransmission(msg.client, msg)
 	}
+}
+
+func (server *Server) handleVoiceBroadcast(vb *VoiceBroadcast) {
+	if vb.Target() == uint8(mumbleproto.TargetRegularSpeech) { // Current channel
+		channel := vb.sender.Channel
+
+		// Send audio to all users that are listening to the channel
+		for _, v := range server.listenerManager.GetListenersForChannel(uint32(channel.Id)) {
+			vb.AddReceiver(server.clients[v], mumbleproto.ContextListen,
+				server.listenerManager.GetVolumeAdjustment(v, uint32(channel.Id)),
+			)
+		}
+
+		// Send audio to all users in the same channel
+		for _, client := range channel.clients {
+			vb.AddReceiver(client, mumbleproto.ContextNormal, nil)
+		}
+
+		// Send audio to all linked channels the user has speak-permission
+		if len(channel.Links) > 0 {
+			linked := channel.AllLinks()
+			for _, lc := range linked {
+				if lc == channel || !acl.HasPermission(&lc.ACL, vb.sender, acl.SpeakPermission) {
+					continue
+				}
+				// ... to all users that are listening to linked channel
+				for _, v := range server.listenerManager.GetListenersForChannel(uint32(lc.Id)) {
+					vb.AddReceiver(server.clients[v], mumbleproto.ContextListen,
+						server.listenerManager.GetVolumeAdjustment(v, uint32(lc.Id)),
+					)
+				}
+				// ... and user in the channel
+				for _, client := range lc.clients {
+					vb.AddReceiver(client, mumbleproto.ContextNormal, nil)
+				}
+			}
+		}
+	} else {
+		target, ok := vb.sender.voiceTargets[uint32(vb.Target())]
+		if !ok {
+			return
+		}
+
+		target.SendVoiceBroadcast(vb)
+	}
+
+	vb.Broadcast()
 }
 
 // Send the content of buf as a UDP packet to addr.
@@ -1114,7 +1360,11 @@ func (server *Server) userEnterChannel(client *Client, channel *Channel, usersta
 
 	server.ClearCaches()
 
-	server.UpdateFrozenUserLastChannel(client)
+	if client.IsRegistered() {
+		if err := server.UserSetLastChannel(client.user, channel); err != nil {
+			server.Panicf("Failed to set user last channel: %v", err)
+		}
+	}
 
 	canspeak := acl.HasPermission(&channel.ACL, client, acl.SpeakPermission)
 	if canspeak == client.Suppress {
@@ -1130,45 +1380,62 @@ func (server *Server) userEnterChannel(client *Client, channel *Channel, usersta
 
 // Register a client on the server.
 func (s *Server) RegisterClient(client *Client) (uid uint32, err error) {
-	// Increment nextUserId only if registration succeeded.
-	defer func() {
-		if err == nil {
-			s.nextUserId += 1
-		}
-	}()
-
-	user, err := NewUser(s.nextUserId, client.Username)
+	tx := s.DB.Tx()
+	u, err := tx.UserRegister(uint64(s.Id), client.Username)
 	if err != nil {
+		tx.Rollback()
+		return
+	}
+
+	user, err := NewUser(uint32(u.UserID), client.Username)
+	if err != nil {
+		tx.Rollback()
 		return 0, err
 	}
 
 	// Grumble can only register users with certificates.
 	if !client.HasCertificate() {
+		tx.Rollback()
 		return 0, errors.New("no cert hash")
 	}
 
-	user.Email = client.Email
-	user.CertHash = client.CertHash()
+	// Save user certficate and email into database
+	info := make(map[database.UserInfoKey]string)
+	if client.Email != "" {
+		info[database.UserEmail] = client.Email
+	}
+	if client.certHash != "" {
+		info[database.UserHash] = client.CertHash()
+	}
+	err = tx.UserInfoSet(uint64(s.Id), u.UserID, info)
+	if err != nil {
+		tx.Rollback()
+		return 0, err
+	}
 
-	uid = s.nextUserId
+	uid = user.Id
 	s.Users[uid] = user
-	s.UserCertMap[client.CertHash()] = user
-	s.UserNameMap[client.Username] = user
 
 	return uid, nil
 }
 
 // RemoveRegistration removes a registered user.
 func (s *Server) RemoveRegistration(uid uint32) (err error) {
-	user, ok := s.Users[uid]
+	_, ok := s.Users[uid]
 	if !ok {
 		return errors.New("unknown user ID")
 	}
 
+	tx := s.DB.Tx()
+	err = tx.UserUnregister(uint64(s.Id), uint64(uid))
+	if err != nil {
+		tx.Rollback()
+		return
+	}
+	tx.Commit()
+
 	// Remove from user maps
 	delete(s.Users, uid)
-	delete(s.UserCertMap, user.CertHash)
-	delete(s.UserNameMap, user.Name)
 
 	// Remove from groups and ACLs.
 	s.removeRegisteredUserFromChannel(uid, s.RootChannel())
@@ -1200,26 +1467,39 @@ func (s *Server) removeRegisteredUserFromChannel(uid uint32, channel *Channel) {
 }
 
 // RemoveChannel removes a channel
-func (server *Server) RemoveChannel(channel *Channel) {
+func (server *Server) RemoveChannel(channel *Channel, dest *Channel) {
 	// Can't remove root
 	if channel == server.RootChannel() {
 		return
 	}
 
-	// Remove all links
-	for _, linkedChannel := range channel.Links {
-		delete(linkedChannel.Links, channel.Id)
+	if dest == nil {
+		dest = channel.parent
 	}
 
 	// Remove all subchannels
 	for _, subChannel := range channel.children {
-		server.RemoveChannel(subChannel)
+		server.RemoveChannel(subChannel, dest)
+	}
+
+	tx := server.DB.Tx()
+	defer tx.Commit()
+
+	// Remove all links
+	for _, linkedChannel := range channel.Links {
+		err := tx.ChannelLinkRemove(uint64(server.Id), uint64(linkedChannel.Id), uint64(channel.Id))
+		if err != nil {
+			tx.Rollback()
+			server.Panicf("Failed to remove channel: %v", err)
+		}
+
+		delete(linkedChannel.Links, channel.Id)
 	}
 
 	// Remove all clients
 	for _, client := range channel.clients {
-		target := channel.parent
-		for target.parent != nil && !acl.HasPermission(&target.ACL, client, acl.EnterPermission) {
+		target := dest
+		for target.parent != nil && (!acl.HasPermission(&target.ACL, client, acl.EnterPermission) || server.IsChannelFull(target, client)) {
 			target = target.parent
 		}
 
@@ -1232,6 +1512,13 @@ func (server *Server) RemoveChannel(channel *Channel) {
 		}
 	}
 
+	// Remove from database
+	err := tx.ChannelRemove(uint64(server.Id), uint64(channel.Id))
+	if err != nil {
+		tx.Rollback()
+		server.Panicf("Failed to remove channel: %v", err)
+	}
+
 	// Remove the channel itself
 	parent := channel.parent
 	delete(parent.children, channel.Id)
@@ -1241,6 +1528,54 @@ func (server *Server) RemoveChannel(channel *Channel) {
 	}
 	if err := server.broadcastProtoMessage(chanremove); err != nil {
 		server.Panicf("%v", err)
+	}
+}
+
+func (server *Server) readBanList() {
+	err := server.DB.Transaction(func(tx *database.DbTx) error {
+		bans, err := tx.BanRead(uint64(server.Id))
+		if err != nil {
+			return err
+		}
+		server.Bans = make([]ban.Ban, len(bans))
+		for i, v := range bans {
+			server.Bans[i] = ban.Ban{
+				IP:       v.Base,
+				Mask:     v.Mask,
+				Username: v.Name,
+				CertHash: string(v.Hash),
+				Reason:   v.Reason,
+				Start:    v.Start.Unix(),
+				Duration: uint32(v.Duraion),
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		server.Panic(err)
+	}
+}
+
+func (server *Server) saveBanList() {
+	banList := make([]database.Ban, len(server.Bans))
+	for i, v := range server.Bans {
+		banList[i] = database.Ban{
+			Base:    v.IP,
+			Mask:    v.Mask,
+			Name:    v.Username,
+			Hash:    []byte(v.CertHash),
+			Reason:  v.Reason,
+			Start:   time.Unix(v.Start, 0),
+			Duraion: int(v.Duration),
+		}
+	}
+
+	err := server.DB.Transaction(func(tx *database.DbTx) error {
+		return tx.BanWrite(banList)
+	})
+	if err != nil {
+		server.Panic(err)
+		return
 	}
 }
 
@@ -1261,7 +1596,7 @@ func (server *Server) RemoveExpiredBans() {
 
 	if update {
 		server.Bans = newBans
-		server.UpdateFrozenBans(server.Bans)
+		server.saveBanList()
 	}
 }
 
@@ -1302,6 +1637,96 @@ func (server *Server) FilterText(text string) (filtered string, err error) {
 		MaxImageMessageLength: server.cfg.IntValue("MaxImageMessageLength"),
 	}
 	return htmlfilter.Filter(text, options)
+}
+
+// UpdateChannel save the channel state into database
+func (server *Server) UpdateChannel(channel *Channel) (err error) {
+	if channel.IsTemporary() {
+		return nil
+	}
+
+	sid := uint64(server.Id)
+	cid := uint64(channel.Id)
+
+	tx := server.DB.Tx()
+	defer tx.Commit()
+
+	parentID := -1
+	if channel.parent != nil {
+		parentID = channel.parent.Id
+	}
+	err = tx.ChannelUpdate(sid, cid, channel.Name, int64(parentID), channel.ACL.InheritACL)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	err = tx.ChannelInfoSet(sid, cid, map[database.ChannelInfoKey]string{
+		database.ChannelDescription: channel.DescriptionBlob,
+		database.ChannelPosition:    strconv.Itoa(channel.Position),
+		database.ChannelMaxUsers:    strconv.Itoa(channel.MaxUsers),
+	})
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	err = tx.GroupDeleteByChannel(sid, cid)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	err = tx.ACLRemoveByChannel(sid, cid)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	for name, group := range channel.ACL.Groups {
+		g, err := tx.GroupAdd(sid, cid, name, group.Inherit, group.Inheritable)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		for uid := range group.Add {
+			err = tx.GroupMemberAdd(sid, g.GroupID, uint64(uid), true)
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+
+		for uid := range group.Remove {
+			err = tx.GroupMemberAdd(sid, g.GroupID, uint64(uid), false)
+			if err != nil {
+				tx.Rollback()
+				return err
+			}
+		}
+	}
+
+	priority := 5
+	for _, acl := range channel.ACL.ACLs {
+		dbacl := database.NewACL(sid, cid, priority).Apply(acl.ApplyHere, acl.ApplySubs).Grant(int(acl.Allow)).Revoke(int(acl.Deny))
+		if acl.UserId >= 0 {
+			dbacl = dbacl.WithUser(uint64(acl.UserId))
+		}
+		if acl.Group != "" {
+			dbacl = dbacl.WithGroup(acl.Group)
+		}
+
+		err = tx.ACLAdd(dbacl)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+
+		priority++
+	}
+
+	return nil
 }
 
 // The accept loop of the server.
@@ -1361,7 +1786,6 @@ func (server *Server) initPerLaunchData() {
 	server.bye = make(chan bool)
 	server.incoming = make(chan *Message)
 	server.voicebroadcast = make(chan *VoiceBroadcast)
-	server.cfgUpdate = make(chan *KeyValuePair)
 	server.tempRemove = make(chan *Channel, 1)
 	server.clientAuthenticated = make(chan *Client)
 }
@@ -1376,7 +1800,6 @@ func (server *Server) cleanPerLaunchData() {
 	server.bye = nil
 	server.incoming = nil
 	server.voicebroadcast = nil
-	server.cfgUpdate = nil
 	server.tempRemove = nil
 	server.clientAuthenticated = nil
 }
@@ -1515,12 +1938,6 @@ func (server *Server) Start() (err error) {
 
 	server.running = true
 
-	// Open a fresh freezer log
-	err = server.openFreezeLog()
-	if err != nil {
-		server.Fatal(err)
-	}
-
 	// Reset the server's per-launch data to
 	// a clean state.
 	server.initPerLaunchData()
@@ -1602,14 +2019,6 @@ func (server *Server) Stop() (err error) {
 		return err
 	}
 
-	// Since we'll (on some OSes) have to wait for the network
-	// goroutines to end, we might as well use the time to store
-	// a full server freeze to disk.
-	err = server.FreezeToFile()
-	if err != nil {
-		server.Fatal(err)
-	}
-
 	// Wait for the three network receiver
 	// goroutines end.
 	server.netwg.Wait()
@@ -1624,4 +2033,86 @@ func (server *Server) Stop() (err error) {
 // Set will set a configuration value
 func (server *Server) Set(key string, value string) {
 	server.cfg.Set(key, value)
+}
+
+// ValidateUsername will check if specified user name is validate
+func (server *Server) ValidateUsername(name string) bool {
+	return len(name) > 0 && len(name) < 128
+}
+
+// ValidateChannelName will check if specified channel name is validate
+func (server *Server) ValidateChannelName(name string) bool {
+	return len(name) > 0 && len(name) < 128
+}
+
+// CanNest check if a channel can be set as a parent
+func (server *Server) CanNest(parent, channel *Channel) bool {
+	parentLevel := -1
+	channelDepth := 0
+	if parent != nil {
+		parentLevel = parent.Level()
+	}
+	if channel != nil {
+		channelDepth = channel.Depth()
+	}
+
+	limit := server.cfg.IntValue("ChannelNestingLimit")
+	return parentLevel+channelDepth < limit
+}
+
+func (server *Server) ChannelReachLimit() bool {
+	limit := server.cfg.IntValue("ChannelCountLimit")
+	if limit > 0 && len(server.Channels) >= limit {
+		return true
+	}
+	return false
+}
+
+func (server *Server) IsChannelFull(channel *Channel, user acl.User) bool {
+	if user != nil && acl.HasPermission(&channel.ACL, user, acl.WritePermission) {
+		return false
+	}
+	if channel.MaxUsers > 0 {
+		return len(channel.clients) >= channel.MaxUsers
+	}
+	globalLimit := server.cfg.IntValue("MaxUsersPerChannel")
+	if globalLimit > 0 {
+		return len(channel.clients) >= globalLimit
+	}
+	return false
+}
+
+func (server *Server) SetChannelListenerVolume(client *Client, channel *Channel, volume float32) error {
+	if client.user == nil {
+		return nil
+	}
+
+	tx := server.DB.Tx()
+	defer tx.Commit()
+
+	return tx.ChannelListenerSetVolume(uint64(server.Id), uint64(client.UserId()), uint64(channel.Id), volume)
+}
+
+func (server *Server) AddChannelListener(client *Client, channel *Channel) error {
+	if client.user == nil {
+		return nil
+	}
+
+	tx := server.DB.Tx()
+	defer tx.Commit()
+
+	_, err := tx.ChannelListenerAdd(uint64(server.Id), uint64(client.UserId()), uint64(channel.Id))
+	return err
+}
+
+func (server *Server) DisableChannelListener(client *Client, channel *Channel) error {
+	if client.user == nil {
+		return nil
+	}
+
+	tx := server.DB.Tx()
+	defer tx.Commit()
+
+	err := tx.ChannelListenerSetEnabled(uint64(server.Id), uint64(client.UserId()), uint64(channel.Id), false)
+	return err
 }

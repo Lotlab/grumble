@@ -9,13 +9,12 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
 
 	"mumble.info/grumble/pkg/blobstore"
+	"mumble.info/grumble/pkg/database"
 	"mumble.info/grumble/pkg/logtarget"
 )
 
-var servers map[int64]*Server
 var blobStore blobstore.BlobStore
 
 func main() {
@@ -109,42 +108,6 @@ func main() {
 		log.Printf("Private key output to %v", keyFn)
 	}
 
-	// Should we import data from a Murmur SQLite file?
-	if SQLiteSupport && len(args.SQLiteDB) > 0 {
-		f, err := os.Open(args.DataDir)
-		if err != nil {
-			log.Fatalf("Murmur import failed: %s", err.Error())
-		}
-		defer f.Close()
-
-		names, err := f.Readdirnames(-1)
-		if err != nil {
-			log.Fatalf("Murmur import failed: %s", err.Error())
-		}
-
-		if !args.CleanUp && len(names) > 0 {
-			log.Fatalf("Non-empty datadir. Refusing to import Murmur data.")
-		}
-		if args.CleanUp {
-			log.Print("Cleaning up existing data directory")
-			for _, name := range names {
-				if err := os.RemoveAll(filepath.Join(args.DataDir, name)); err != nil {
-					log.Fatalf("Unable to cleanup file: %s", name)
-				}
-			}
-		}
-
-		log.Printf("Importing Murmur data from '%s'", args.SQLiteDB)
-		if err = MurmurImport(args.SQLiteDB, args.DataDir); err != nil {
-			log.Fatalf("Murmur import failed: %s", err.Error())
-		}
-
-		log.Printf("Import from Murmur SQLite database succeeded.")
-		log.Printf("Please restart Grumble to make use of the imported data.")
-
-		return
-	}
-
 	// Create the servers directory if it doesn't already
 	// exist.
 	serversDirPath := filepath.Join(args.DataDir, "servers")
@@ -153,55 +116,56 @@ func main() {
 		log.Fatalf("Unable to create servers directory: %v", err)
 	}
 
-	// Read all entries of the servers directory.
-	// We need these to load our virtual servers.
-	serversDir, err := os.Open(serversDirPath)
-	if err != nil {
-		log.Fatalf("Unable to open the servers directory: %v", err.Error())
+	// Load database file, create server from database
+	if len(args.SQLiteDB) == 0 {
+		args.SQLiteDB = filepath.Join(args.DataDir, "murmur.sqlite")
+		log.Printf("Murmur SQLite database is not specified, will use %s as default.", args.SQLiteDB)
 	}
-	names, err := serversDir.Readdirnames(-1)
+	db, err := database.NewDB(&database.DbConfig{
+		Type: "sqlite",
+		Conn: args.SQLiteDB,
+	})
 	if err != nil {
-		log.Fatalf("Unable to read file from data directory: %v", err.Error())
+		log.Fatalf("Unable to open the servers database: %v", err.Error())
 	}
-	// The data dir file descriptor.
-	err = serversDir.Close()
+	err = db.Init()
 	if err != nil {
-		log.Fatalf("Unable to close data directory: %v", err.Error())
-		return
+		log.Fatalf("Unable to initialize database: %v", err.Error())
 	}
 
-	// Look through the list of files in the data directory, and
-	// load all virtual servers from disk.
-	servers = make(map[int64]*Server)
-	nameMatch := regexp.MustCompile("^[0-9]+$")
-	for _, name := range names {
-		if nameMatch.MatchString(name) {
-			log.Printf("Loading server %v", name)
-			s, err := NewServerFromFrozen(name, args.DataDir)
-			if err != nil {
-				log.Fatalf("Unable to load server: %v", err.Error())
-			}
-			err = s.FreezeToFile()
-			if err != nil {
-				log.Fatalf("Unable to freeze server to disk: %v", err.Error())
-			}
-			servers[s.Id] = s
+	tx := db.Tx()
+	dbServerList, err := tx.ServerList(0, 1000)
+	if err != nil {
+		tx.Rollback()
+		log.Fatalf("Unable fetch server list from database: %v", err.Error())
+	}
+	tx.Commit()
+
+	servers := make([]*Server, len(dbServerList))
+	for i, v := range dbServerList {
+		serv, err := NewServer(int64(v.ServerID), args.DataDir, db)
+		if err != nil {
+			log.Fatalf("Unable to create server from database: %v", err.Error())
 		}
+		servers[i] = serv
 	}
 
 	// If no servers were found, create the default virtual server.
 	if len(servers) == 0 {
-		s, err := NewServer(1, args.DataDir)
+		tx := db.Tx()
+		rootSrv, err := tx.ServerAdd()
+		if err != nil {
+			tx.Rollback()
+			log.Fatalf("Couldn't create server: %s", err.Error())
+		}
+		tx.Commit()
+
+		s, err := NewServer(int64(rootSrv.ServerID), args.DataDir, db)
 		if err != nil {
 			log.Fatalf("Couldn't start server: %s", err.Error())
 		}
 
-		servers[s.Id] = s
-		os.Mkdir(filepath.Join(serversDirPath, fmt.Sprintf("%v", 1)), 0750)
-		err = s.FreezeToFile()
-		if err != nil {
-			log.Fatalf("Unable to freeze newly created server to disk: %v", err.Error())
-		}
+		servers = append(servers, s)
 	}
 
 	// Launch the servers we found during launch...

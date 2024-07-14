@@ -7,6 +7,8 @@ package main
 import (
 	"encoding/hex"
 	"errors"
+
+	"mumble.info/grumble/pkg/database"
 )
 
 // This file implements Server's handling of Users.
@@ -16,13 +18,9 @@ import (
 type User struct {
 	Id            uint32
 	Name          string
-	Password      string
-	CertHash      string
-	Email         string
 	TextureBlob   string
 	CommentBlob   string
 	LastChannelId int
-	LastActive    uint64
 }
 
 // Create a new User
@@ -35,6 +33,22 @@ func NewUser(id uint32, name string) (user *User, err error) {
 		Id:   id,
 		Name: name,
 	}, nil
+}
+
+func UserFromDatabase(dbu *database.User, tx *database.DbTx) *User {
+	user := User{
+		Id:            uint32(dbu.UserID),
+		Name:          dbu.Name,
+		TextureBlob:   hex.EncodeToString(dbu.Texture),
+		LastChannelId: int(dbu.LastChannel),
+	}
+
+	if tx != nil {
+		cmt, _ := tx.UserInfoGet(dbu.ServerID, dbu.UserID, database.UserComment)
+		user.CommentBlob = cmt
+	}
+
+	return &user
 }
 
 // HasComment Does the channel have comment?
@@ -65,4 +79,47 @@ func (user *User) TextureBlobHashBytes() (buf []byte) {
 		return nil
 	}
 	return buf
+}
+
+// UserSetTexture updates user texture in database
+func (server *Server) UserSetTexture(user *User, key string) error {
+	return server.DB.Transaction(func(tx *database.DbTx) error {
+		hash, err := hex.DecodeString(key)
+		if err != nil {
+			return err
+		}
+
+		if err := tx.UserSetTexture(uint64(server.Id), uint64(user.Id), hash); err != nil {
+			return err
+		}
+
+		user.TextureBlob = key
+		return nil
+	})
+}
+
+// UserSetComment updates user texture in database
+func (server *Server) UserSetComment(user *User, key string) error {
+	return server.DB.Transaction(func(tx *database.DbTx) error {
+		if err := tx.UserInfoSet(uint64(server.Id), uint64(user.Id), map[database.UserInfoKey]string{
+			database.UserComment: key,
+		}); err != nil {
+			return err
+		}
+
+		user.CommentBlob = key
+		return nil
+	})
+}
+
+// UserSetLastChannel updates user last channel in database
+func (server *Server) UserSetLastChannel(user *User, ch *Channel) error {
+	return server.DB.Transaction(func(tx *database.DbTx) error {
+		if err := tx.UserSetLastChannel(uint64(server.Id), uint64(user.Id), uint64(ch.Id)); err != nil {
+			return err
+		}
+
+		user.LastChannelId = ch.Id
+		return nil
+	})
 }

@@ -75,6 +75,13 @@ func (d *GrumbleDb) Tx() DbTx {
 func (d *DbTx) Commit() error {
 	return d.db.Commit().Error
 }
+
 func (d *DbTx) Rollback() error {
 	return d.db.Rollback().Error
+}
+
+func (d *GrumbleDb) Transaction(fc func(tx *DbTx) error) error {
+	return d.db.Transaction(func(tx *gorm.DB) error {
+		return fc(&DbTx{db: tx})
+	})
 }
